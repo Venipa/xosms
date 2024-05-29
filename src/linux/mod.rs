@@ -391,7 +391,7 @@ impl MediaPlayer {
     }
 
     if let Ok(mut player_state) = self.player_state.write() {
-      // If the position moved more than 1 second within 1 second of time then a seeked signal needs to be emitted
+      // If the position moved more than the playback rate within 1 second of time then a seeked signal needs to be emitted
       if position - player_state.position > player_state.playback_rate
         && player_state.last_updated_position.elapsed().as_secs() < 1
       {
@@ -803,10 +803,10 @@ impl MediaPlayer {
           Variant(Box::new("/org/mpris/MediaPlayer2/TrackList/NoTrack")),
         );
       } else {
-      metadata.insert(
-        "mpris:trackid".to_string(),
-        Variant(Box::new(format!("/xosms/trackid/{}", state.track_id))),
-      );
+        metadata.insert(
+          "mpris:trackid".to_string(),
+          Variant(Box::new(format!("/xosms/trackid/{}", state.track_id))),
+        );
       }
       metadata.insert(
         "mpris:length".to_string(),
