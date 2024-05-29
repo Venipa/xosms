@@ -1066,7 +1066,7 @@ impl OrgMprisMediaPlayer2Player for MprisPlayer {
       if position < 0 {
         return Ok(());
       }
-      if Duration::from_micros(position as u64).as_secs_f64() > state.position {
+      if Duration::from_micros(position as u64).as_secs_f64() > state.duration {
         return Ok(());
       }
       // The track id being different signifies that this may have been called too late and should be ignored
