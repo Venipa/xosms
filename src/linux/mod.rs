@@ -800,7 +800,7 @@ impl MediaPlayer {
       if state.track_id == "" {
         metadata.insert(
           "mpris:trackid".to_string(),
-          Variant(Box::new("/org/mpris/MediaPlayer2/TrackList/NoTrack")),
+          Variant(Box::new("/org/mpris/MediaPlayer2/TrackList/NoTrack".to_string())),
         );
       } else {
         metadata.insert(
