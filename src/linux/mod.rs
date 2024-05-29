@@ -797,10 +797,17 @@ impl MediaPlayer {
   fn construct_metadata(&self) -> Box<PropMap> {
     if let Ok(state) = self.player_state.read() {
       let mut metadata = Box::new(PropMap::new());
+      if state.track_id == "" {
+        metadata.insert(
+          "mpris:trackid".to_string(),
+          Variant(Box::new("/org/mpris/MediaPlayer2/TrackList/NoTrack")),
+        );
+      } else {
       metadata.insert(
         "mpris:trackid".to_string(),
         Variant(Box::new(format!("/xosms/trackid/{}", state.track_id))),
       );
+      }
       metadata.insert(
         "mpris:length".to_string(),
         Variant(Box::new(
