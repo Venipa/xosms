@@ -38,7 +38,7 @@
     "version": "napi version"
   },
   "packageManager": "yarn@4.1.0",
-  "repository": "https://github.com/NovusTheory/xosms",
+  "repository": "https://github.com/Venipa/xosms",
   "description": "Cross platform media service module. Hooks into each operating system's native media service and provides a simple API to access and use it.",
   "keywords": [
     "electron",
