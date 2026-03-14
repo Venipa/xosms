@@ -14,8 +14,15 @@
       ]
     },
     "package": {
-      "name": "@xosms/xosms"
+      "name": "@Venipa/xosms"
     }
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public",
+    "tag": "latest",
+    "provenance": false,
+    "scope": "Venipa"
   },
   "license": "Apache-2.0",
   "devDependencies": {
