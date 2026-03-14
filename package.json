@@ -54,14 +54,5 @@
     "cross",
     "platform",
     "cross platform"
-  ],
-  "optionalDependencies": {
-    "@venipa/xosms-win32-x64-msvc": "0.7.0",
-    "@venipa/xosms-darwin-x64": "0.7.0",
-    "@venipa/xosms-linux-x64-gnu": "0.7.0",
-    "@venipa/xosms-darwin-arm64": "0.7.0",
-    "@venipa/xosms-linux-arm64-gnu": "0.7.0",
-    "@venipa/xosms-win32-arm64-msvc": "0.7.0",
-    "@venipa/xosms-darwin-universal": "0.7.0"
-  }
+  ]
 }

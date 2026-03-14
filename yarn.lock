@@ -77,6 +77,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@venipa/xosms@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "@venipa/xosms@workspace:."
+  dependencies:
+    "@napi-rs/cli": "npm:^2.18.0"
+    ava: "npm:^6.0.1"
+  languageName: unknown
+  linkType: soft
+
 "@vercel/nft@npm:^0.26.2":
   version: 0.26.4
   resolution: "@vercel/nft@npm:0.26.4"
@@ -1505,15 +1514,6 @@ __metadata:
   checksum: 10c0/e8c850a8e3e74eeadadb8ad23c9d9d63e4e792bd10f4836ed74189ef6e996763959f1249c5650e232f3c77c11169d239cbfc8342fc70f3fe401407d23810505d
   languageName: node
   linkType: hard
-
-"xosms@workspace:.":
-  version: 0.0.0-use.local
-  resolution: "xosms@workspace:."
-  dependencies:
-    "@napi-rs/cli": "npm:^2.18.0"
-    ava: "npm:^6.0.1"
-  languageName: unknown
-  linkType: soft
 
 "y18n@npm:^5.0.5":
   version: 5.0.8
