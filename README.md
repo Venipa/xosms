@@ -1,4 +1,4 @@
-# Xosms [![build](https://github.com/NovusTheory/xosms/actions/workflows/CI.yml/badge.svg?branch=dev)](https://github.com/NovusTheory/xosms/actions/workflows/CI.yml) [![npm version](https://badge.fury.io/js/xosms.svg)](https://badge.fury.io/js/xosms)
+# Xosms [![build](https://github.com/venipa/xosms/actions/workflows/CI.yml/badge.svg?branch=dev)](https://github.com/venipa/xosms/actions/workflows/CI.yml) [![npm version](https://badge.fury.io/js/xosms.svg)](https://badge.fury.io/js/xosms)
 A cross platform media service library made in Rust for Node to easily and seamelessly integrate with the operating systems media service API.
 
 

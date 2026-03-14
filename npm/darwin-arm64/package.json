@@ -1,5 +1,5 @@
 {
-  "name": "@xosms/xosms-darwin-arm64",
+  "name": "@venipa/xosms-darwin-arm64",
   "version": "0.7.0",
   "os": [
     "darwin"
@@ -16,5 +16,5 @@
   "engines": {
     "node": ">= 10"
   },
-  "repository": "https://github.com/NovusTheory/xosms"
+  "repository": "https://github.com/venipa/xosms"
 }
