@@ -45,7 +45,7 @@
     "version": "napi version"
   },
   "packageManager": "yarn@4.1.0",
-  "repository": "https://github.com/Venipa/xosms",
+  "repository": "https://github.com/Venipa/xosms.git",
   "description": "Cross platform media service module. Hooks into each operating system's native media service and provides a simple API to access and use it.",
   "keywords": [
     "electron",
@@ -57,12 +57,12 @@
     "cross platform"
   ],
   "optionalDependencies": {
-    "@xosms/xosms-win32-x64-msvc": "0.7.0",
-    "@xosms/xosms-darwin-x64": "0.7.0",
-    "@xosms/xosms-linux-x64-gnu": "0.7.0",
-    "@xosms/xosms-darwin-arm64": "0.7.0",
-    "@xosms/xosms-linux-arm64-gnu": "0.7.0",
-    "@xosms/xosms-win32-arm64-msvc": "0.7.0",
-    "@xosms/xosms-darwin-universal": "0.7.0"
+    "@Venipa/xosms-win32-x64-msvc": "0.7.0",
+    "@Venipa/xosms-darwin-x64": "0.7.0",
+    "@Venipa/xosms-linux-x64-gnu": "0.7.0",
+    "@Venipa/xosms-darwin-arm64": "0.7.0",
+    "@Venipa/xosms-linux-arm64-gnu": "0.7.0",
+    "@Venipa/xosms-win32-arm64-msvc": "0.7.0",
+    "@Venipa/xosms-darwin-universal": "0.7.0"
   }
 }
