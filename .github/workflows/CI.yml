@@ -292,10 +292,10 @@ jobs:
           echo "//@venipa:registry=https://npm.pkg.github.com" >> ~/.npmrc
           if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$";
           then
-            npm publish --access public
+            npm publish --access public --registry https://npm.pkg.github.com
           elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+";
           then
-            npm publish --tag next --access public
+            npm publish --tag next --access public --registry https://npm.pkg.github.com
           else
             echo "Not a release, skipping publish"
           fi
