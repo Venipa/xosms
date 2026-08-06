@@ -3,6 +3,7 @@ env:
   DEBUG: napi:*
   APP_NAME: xosms
   MACOSX_DEPLOYMENT_TARGET: '10.13'
+  NODE_VERSION: '24'
 permissions:
   contents: write
   id-token: write
@@ -47,7 +48,7 @@ jobs:
           - host: windows-latest
             target: aarch64-pc-windows-msvc
             build: yarn build --target aarch64-pc-windows-msvc
-    name: stable - ${{ matrix.settings.target }} - node@20
+    name: stable - ${{ matrix.settings.target }} - node@${{ env.NODE_VERSION }}
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v7
@@ -55,7 +56,7 @@ jobs:
         uses: actions/setup-node@v7
         if: ${{ !matrix.settings.docker }}
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
           cache: yarn
       - name: Install
         uses: dtolnay/rust-toolchain@stable
@@ -91,7 +92,7 @@ jobs:
         uses: actions/setup-node@v7
         if: matrix.settings.target == 'i686-pc-windows-msvc'
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
           cache: yarn
           architecture: x86
       - name: Build in docker
@@ -112,7 +113,7 @@ jobs:
           path: ${{ env.APP_NAME }}.*.node
           if-no-files-found: error
   test-macOS-windows-binding:
-    name: Test bindings on ${{ matrix.settings.target }} - node@${{ matrix.node }}
+    name: Test bindings on ${{ matrix.settings.target }} - node@${{ env.NODE_VERSION }}
     needs:
       - build
     strategy:
@@ -123,16 +124,13 @@ jobs:
             target: aarch64-apple-darwin
           - host: windows-latest
             target: x86_64-pc-windows-msvc
-        node:
-          - '18'
-          - '20'
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v7
       - name: Setup node
         uses: actions/setup-node@v7
         with:
-          node-version: ${{ matrix.node }}
+          node-version: ${{ env.NODE_VERSION }}
           cache: yarn
       - name: Install dependencies
         run: yarn install
@@ -147,22 +145,16 @@ jobs:
       - name: Test bindings
         run: yarn test
   test-linux-x64-gnu-binding:
-    name: Test bindings on Linux-x64-gnu - node@${{ matrix.node }}
+    name: Test bindings on Linux-x64-gnu - node@${{ env.NODE_VERSION }}
     needs:
       - build
-    strategy:
-      fail-fast: false
-      matrix:
-        node:
-          - '18'
-          - '20'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: Setup node
         uses: actions/setup-node@v7
         with:
-          node-version: ${{ matrix.node }}
+          node-version: ${{ env.NODE_VERSION }}
           cache: yarn
       - name: Install dependencies
         run: yarn install
@@ -177,7 +169,7 @@ jobs:
       - name: Setup and run tests
         uses: addnab/docker-run-action@v3
         with:
-          image: node:${{ matrix.node }}-slim
+          image: node:${{ env.NODE_VERSION }}-slim
           options: '-v ${{ github.workspace }}:/build -w /build'
           run: |
             apt-get update
@@ -185,15 +177,9 @@ jobs:
             export DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --session --fork --print-address | cut -d, -f1)
             yarn test
   test-linux-aarch64-gnu-binding:
-    name: Test bindings on aarch64-unknown-linux-gnu - node@${{ matrix.node }}
+    name: Test bindings on aarch64-unknown-linux-gnu - node@${{ env.NODE_VERSION }}
     needs:
       - build
-    strategy:
-      fail-fast: false
-      matrix:
-        node:
-          - '18'
-          - '20'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -218,7 +204,7 @@ jobs:
       - name: Setup and run tests
         uses: addnab/docker-run-action@v3
         with:
-          image: node:${{ matrix.node }}-slim
+          image: node:${{ env.NODE_VERSION }}-slim
           options: '--platform linux/arm64 -v ${{ github.workspace }}:/build -w /build'
           run: |
             set -e
@@ -237,7 +223,7 @@ jobs:
       - name: Setup node
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
           cache: yarn
       - name: Install dependencies
         run: yarn install
@@ -272,7 +258,7 @@ jobs:
       - name: Setup node
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
           cache: yarn
       - name: Install dependencies
         run: yarn install
