@@ -1,3 +1,8 @@
 {
-    "rust-analyzer.procMacro.ignored": { "napi-derive": ["napi"] }
+    "rust-analyzer.procMacro.ignored": {
+      "napi-derive": [
+        "napi"
+      ]
+    },
+    "vscord.enable": false
 }
