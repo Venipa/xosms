@@ -48,7 +48,7 @@ jobs:
           - host: windows-latest
             target: aarch64-pc-windows-msvc
             build: yarn build --target aarch64-pc-windows-msvc
-    name: stable - ${{ matrix.settings.target }} - node@${{ env.NODE_VERSION }}
+    name: stable - ${{ matrix.settings.target }}
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v7
@@ -113,7 +113,7 @@ jobs:
           path: ${{ env.APP_NAME }}.*.node
           if-no-files-found: error
   test-macOS-windows-binding:
-    name: Test bindings on ${{ matrix.settings.target }} - node@${{ env.NODE_VERSION }}
+    name: Test bindings on ${{ matrix.settings.target }}
     needs:
       - build
     strategy:
@@ -145,7 +145,7 @@ jobs:
       - name: Test bindings
         run: yarn test
   test-linux-x64-gnu-binding:
-    name: Test bindings on Linux-x64-gnu - node@${{ env.NODE_VERSION }}
+    name: Test bindings on Linux-x64-gnu
     needs:
       - build
     runs-on: ubuntu-latest
@@ -177,7 +177,7 @@ jobs:
             export DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --session --fork --print-address | cut -d, -f1)
             yarn test
   test-linux-aarch64-gnu-binding:
-    name: Test bindings on aarch64-unknown-linux-gnu - node@${{ env.NODE_VERSION }}
+    name: Test bindings on aarch64-unknown-linux-gnu
     needs:
       - build
     runs-on: ubuntu-latest
