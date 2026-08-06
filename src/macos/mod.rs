@@ -15,6 +15,12 @@ use souvlaki::{
   SeekDirection,
 };
 
+/// Default relative seek amount when macOS sends a direction-only seek command.
+const DEFAULT_SEEK_STEP_SECS: f64 = 15.0;
+
+type ButtonListeners = Arc<DashMap<usize, ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>>;
+type PositionListeners = Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>;
+
 #[napi]
 #[derive(Debug, PartialEq, Eq)]
 pub enum MediaPlayerThumbnailType {
@@ -31,7 +37,7 @@ pub enum MediaPlayerMediaType {
 }
 
 #[napi]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum MediaPlayerPlaybackStatus {
   Unknown = -1,
   Playing = 1,
@@ -74,36 +80,6 @@ impl MediaPlayerThumbnail {
   pub fn thumbnail_type(&self) -> MediaPlayerThumbnailType {
     self.thumbnail_type
   }
-}
-
-#[derive(Debug)]
-struct MediaPlayerState {
-  active: bool,
-  can_go_next: bool,
-  can_go_previous: bool,
-  can_play: bool,
-  can_pause: bool,
-  can_seek: bool,
-  can_control: bool,
-  media_type: MediaPlayerMediaType,
-  playback_status: MediaPlayerPlaybackStatus,
-  thumbnail: String,
-  artist: String,
-  album_title: String,
-  title: String,
-  track_id: String,
-  duration: f64,
-  position: f64,
-  playback_rate: f64,
-  state_revision: u64,
-  track_revision: u64,
-  position_event_track_revision: u64,
-  track_transition_pending: bool,
-  prefer_last_playback_position_for_status_flush: bool,
-  metadata_dirty: bool,
-  playback_dirty: bool,
-  last_metadata_snapshot: Option<MetadataSnapshot>,
-  last_playback_snapshot: Option<PlaybackSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -158,34 +134,41 @@ struct PlaybackPatchResult {
   completed_track_transition: bool,
 }
 
-#[napi(custom_finalize)]
-struct MediaPlayer {
-  media_controls: MediaControls,
-  button_pressed_listeners:
-    Arc<DashMap<usize, ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>>,
-  playback_position_changed_listeners:
-    Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>,
-  playback_position_seeked_listeners:
-    Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>,
-  state: Arc<RwLock<MediaPlayerState>>,
+#[derive(Debug)]
+struct MediaPlayerState {
+  active: bool,
+  can_go_next: bool,
+  can_go_previous: bool,
+  can_play: bool,
+  can_pause: bool,
+  can_seek: bool,
+  can_control: bool,
+  media_type: MediaPlayerMediaType,
+  playback_status: MediaPlayerPlaybackStatus,
+  thumbnail: String,
+  artist: String,
+  album_title: String,
+  title: String,
+  track_id: String,
+  duration: f64,
+  position: f64,
+  playback_rate: f64,
+  state_revision: u64,
+  track_revision: u64,
+  /// Track revision that may accept `SetPosition` events from the OS.
+  position_event_track_revision: u64,
+  track_transition_pending: bool,
+  /// Avoid Now Playing position jumps when only status changes (e.g. pause).
+  prefer_last_playback_position_for_status_flush: bool,
+  metadata_dirty: bool,
+  playback_dirty: bool,
+  last_metadata_snapshot: Option<MetadataSnapshot>,
+  last_playback_snapshot: Option<PlaybackSnapshot>,
 }
 
-#[napi]
-impl MediaPlayer {
-  #[napi(constructor)]
-  #[allow(dead_code)]
-  pub fn new(service_name: String, identity: String) -> napi::Result<Self> {
-    let button_pressed_listeners: Arc<
-      DashMap<usize, ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>,
-    > = Arc::new(DashMap::new());
-    let playback_position_changed_listeners: Arc<
-      DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>,
-    > = Arc::new(DashMap::new());
-    let playback_position_seeked_listeners: Arc<
-      DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>,
-    > = Arc::new(DashMap::new());
-
-    let state: Arc<RwLock<MediaPlayerState>> = Arc::new(RwLock::new(MediaPlayerState {
+impl Default for MediaPlayerState {
+  fn default() -> Self {
+    Self {
       active: false,
       can_go_next: false,
       can_go_previous: false,
@@ -212,28 +195,224 @@ impl MediaPlayer {
       playback_dirty: false,
       last_metadata_snapshot: None,
       last_playback_snapshot: None,
-    }));
+    }
+  }
+}
 
-    let mut media_controls: MediaControls = MediaControls::new(PlatformConfig {
+impl MediaPlayerState {
+  fn bump_revision(&mut self) {
+    self.state_revision = self.state_revision.saturating_add(1);
+  }
+
+  fn apply_title_patch(&mut self, patch: TitleDataPatch) -> bool {
+    let mut changed = false;
+
+    changed |= assign_if_changed(&mut self.title, patch.title);
+    changed |= assign_if_changed(&mut self.artist, patch.artist);
+    changed |= assign_if_changed(&mut self.album_title, patch.album_title);
+    changed |= assign_if_changed(&mut self.thumbnail, patch.thumbnail);
+
+    if let Some(track_id) = patch.track_id {
+      if self.track_id != track_id {
+        self.track_id = track_id;
+        self.track_revision = self.track_revision.saturating_add(1);
+        self.track_transition_pending = true;
+        self.duration = 0.0;
+        self.position = 0.0;
+        self.playback_dirty = true;
+        self.prefer_last_playback_position_for_status_flush = false;
+        changed = true;
+      }
+    }
+
+    if changed {
+      self.metadata_dirty = true;
+      self.bump_revision();
+    }
+
+    changed
+  }
+
+  fn apply_playback_patch(&mut self, patch: PlaybackStatePatch) -> PlaybackPatchResult {
+    let mut playback_changed = false;
+    let mut duration_changed = false;
+    let mut playback_status_changed = false;
+    let mut completed_track_transition = false;
+
+    if let Some(duration) = patch.duration {
+      if (self.duration - duration).abs() > f64::EPSILON {
+        self.duration = duration;
+        duration_changed = true;
+      }
+    }
+
+    if let Some(position) = patch.position {
+      if (self.position - position).abs() > f64::EPSILON {
+        self.position = position;
+        playback_changed = true;
+      }
+    }
+
+    if let Some(playback_status) = patch.playback_status {
+      if self.playback_status != playback_status {
+        self.playback_status = playback_status;
+        playback_status_changed = true;
+        playback_changed = true;
+      }
+    }
+
+    if duration_changed {
+      self.metadata_dirty = true;
+      playback_changed = true;
+    }
+
+    if self.track_transition_pending && (duration_changed || patch.position.is_some()) {
+      self.position_event_track_revision = self.track_revision;
+      self.track_transition_pending = false;
+      completed_track_transition = true;
+    }
+
+    if patch.position.is_some() || duration_changed {
+      self.prefer_last_playback_position_for_status_flush = false;
+    } else if playback_status_changed {
+      self.prefer_last_playback_position_for_status_flush = true;
+    }
+
+    if playback_changed {
+      self.playback_dirty = true;
+      self.bump_revision();
+    }
+
+    PlaybackPatchResult {
+      changed: playback_changed,
+      completed_track_transition,
+    }
+  }
+
+  fn metadata_snapshot(&self) -> MetadataSnapshot {
+    MetadataSnapshot {
+      title: self.title.clone(),
+      album_title: self.album_title.clone(),
+      artist: self.artist.clone(),
+      thumbnail: self.thumbnail.clone(),
+      duration: self.duration.max(0.0),
+    }
+  }
+
+  fn playback_snapshot(&self) -> PlaybackSnapshot {
+    let position = if self.prefer_last_playback_position_for_status_flush
+      && !self.track_transition_pending
+    {
+      self
+        .last_playback_snapshot
+        .as_ref()
+        .map_or(self.position.max(0.0), |snapshot| snapshot.position.max(0.0))
+    } else {
+      self.position.max(0.0)
+    };
+
+    PlaybackSnapshot {
+      playback_status: self.playback_status,
+      position,
+    }
+  }
+
+  fn should_emit_metadata(&self, snapshot: &MetadataSnapshot, flush_mode: FlushMode) -> bool {
+    matches!(
+      flush_mode,
+      FlushMode::Full | FlushMode::TrackChange | FlushMode::MetadataOnly
+    ) && (self.metadata_dirty || self.last_metadata_snapshot.as_ref() != Some(snapshot))
+  }
+
+  fn should_emit_playback(&self, snapshot: &PlaybackSnapshot, flush_mode: FlushMode) -> bool {
+    matches!(
+      flush_mode,
+      FlushMode::Full | FlushMode::TrackChange | FlushMode::PlaybackOnly
+    ) && (self.playback_dirty || self.last_playback_snapshot.as_ref() != Some(snapshot))
+  }
+
+  fn create_flush_payload(&self, flush_mode: FlushMode) -> Option<FlushPayload> {
+    if !self.active || matches!(flush_mode, FlushMode::None) {
+      return None;
+    }
+
+    let metadata_snapshot = self.metadata_snapshot();
+    let playback_snapshot = self.playback_snapshot();
+    let emit_metadata = self.should_emit_metadata(&metadata_snapshot, flush_mode);
+    let emit_playback = self.should_emit_playback(&playback_snapshot, flush_mode);
+
+    if !emit_metadata && !emit_playback {
+      return None;
+    }
+
+    Some(FlushPayload {
+      state_revision: self.state_revision,
+      metadata: emit_metadata.then_some(metadata_snapshot),
+      playback: emit_playback.then_some(playback_snapshot),
+    })
+  }
+
+  fn mark_metadata_flushed(&mut self, state_revision: u64, snapshot: MetadataSnapshot) {
+    self.last_metadata_snapshot = Some(snapshot);
+    if self.state_revision == state_revision {
+      self.metadata_dirty = false;
+    }
+  }
+
+  fn mark_playback_flushed(&mut self, state_revision: u64, snapshot: PlaybackSnapshot) {
+    self.last_playback_snapshot = Some(snapshot);
+    if self.state_revision == state_revision {
+      self.playback_dirty = false;
+      self.prefer_last_playback_position_for_status_flush = false;
+    }
+  }
+
+  fn accepts_set_position(&self, requested_seconds: f64) -> bool {
+    self.can_seek
+      && requested_seconds <= self.duration
+      && self.position_event_track_revision == self.track_revision
+  }
+}
+
+#[napi(custom_finalize)]
+struct MediaPlayer {
+  media_controls: MediaControls,
+  button_pressed_listeners: ButtonListeners,
+  playback_position_changed_listeners: PositionListeners,
+  playback_position_seeked_listeners: PositionListeners,
+  state: Arc<RwLock<MediaPlayerState>>,
+}
+
+#[napi]
+impl MediaPlayer {
+  #[napi(constructor)]
+  #[allow(dead_code)]
+  pub fn new(service_name: String, identity: String) -> napi::Result<Self> {
+    let button_pressed_listeners = Arc::new(DashMap::new());
+    let playback_position_changed_listeners = Arc::new(DashMap::new());
+    let playback_position_seeked_listeners = Arc::new(DashMap::new());
+    let state = Arc::new(RwLock::new(MediaPlayerState::default()));
+
+    let mut media_controls = MediaControls::new(PlatformConfig {
       display_name: &identity,
       dbus_name: &service_name,
       hwnd: Option::<*mut c_void>::None,
     })
     .map_err(map_souvlaki_error)?;
 
-    let closure_state: Arc<RwLock<MediaPlayerState>> = state.clone();
-    let closure_button_pressed_listeners = button_pressed_listeners.clone();
-    let closure_position_changed_listeners = playback_position_changed_listeners.clone();
-    let closure_position_seeked_listeners = playback_position_seeked_listeners.clone();
+    let event_state = state.clone();
+    let event_buttons = button_pressed_listeners.clone();
+    let event_position_changed = playback_position_changed_listeners.clone();
+    let event_position_seeked = playback_position_seeked_listeners.clone();
 
     media_controls
       .attach(move |event: MediaControlEvent| {
         handle_media_control_event(
           event,
-          &closure_state,
-          &closure_button_pressed_listeners,
-          &closure_position_changed_listeners,
-          &closure_position_seeked_listeners,
+          &event_state,
+          &event_buttons,
+          &event_position_changed,
+          &event_position_seeked,
         );
       })
       .map_err(map_souvlaki_error)?;
@@ -251,9 +430,7 @@ impl MediaPlayer {
   #[napi]
   #[allow(dead_code)]
   pub fn activate(&mut self) -> napi::Result<()> {
-    if let Ok(mut state) = self.state.write() {
-      state.active = true;
-    }
+    self.with_state_mut(|state| state.active = true);
     self.flush_state(FlushMode::Full)
   }
 
@@ -261,9 +438,7 @@ impl MediaPlayer {
   #[napi]
   #[allow(dead_code)]
   pub fn deactivate(&mut self) -> napi::Result<()> {
-    if let Ok(mut state) = self.state.write() {
-      state.active = false;
-    }
+    self.with_state_mut(|state| state.active = false);
     self
       .media_controls
       .set_playback(MediaPlayback::Stopped)
@@ -284,50 +459,18 @@ impl MediaPlayer {
     event_name: String,
     callback: JsFunction,
   ) -> napi::Result<()> {
-    let callback_ptr: usize = unsafe { callback.raw() as usize };
+    let callback_ptr = unsafe { callback.raw() as usize };
 
     match event_name.as_str() {
-      "buttonpressed" => {
-        if !self.button_pressed_listeners.contains_key(&callback_ptr) {
-          let mut threadsafe_callback = callback.create_threadsafe_function(0, |ctx| {
-            ctx.env.create_string_from_std(ctx.value).map(|v| vec![v])
-          })?;
-          let _ = threadsafe_callback.unref(&env)?;
-          self
-            .button_pressed_listeners
-            .insert(callback_ptr, threadsafe_callback);
-        }
-      }
+      "buttonpressed" => insert_string_listener(&self.button_pressed_listeners, env, callback_ptr, callback)?,
       "positionchanged" => {
-        if !self
-          .playback_position_changed_listeners
-          .contains_key(&callback_ptr)
-        {
-          let mut threadsafe_callback = callback.create_threadsafe_function(0, |ctx| {
-            ctx.env.create_double(ctx.value).map(|v| vec![v])
-          })?;
-          let _ = threadsafe_callback.unref(&env)?;
-          self
-            .playback_position_changed_listeners
-            .insert(callback_ptr, threadsafe_callback);
-        }
+        insert_f64_listener(&self.playback_position_changed_listeners, env, callback_ptr, callback)?
       }
       "positionseeked" => {
-        if !self
-          .playback_position_seeked_listeners
-          .contains_key(&callback_ptr)
-        {
-          let mut threadsafe_callback = callback.create_threadsafe_function(0, |ctx| {
-            ctx.env.create_double(ctx.value).map(|v| vec![v])
-          })?;
-          let _ = threadsafe_callback.unref(&env)?;
-          self
-            .playback_position_seeked_listeners
-            .insert(callback_ptr, threadsafe_callback);
-        }
+        insert_f64_listener(&self.playback_position_seeked_listeners, env, callback_ptr, callback)?
       }
       _ => {}
-    };
+    }
 
     Ok(())
   }
@@ -341,36 +484,20 @@ impl MediaPlayer {
     event_name: String,
     callback: JsFunction,
   ) -> napi::Result<()> {
-    let callback_ptr: usize = unsafe { callback.raw() as usize };
+    let callback_ptr = unsafe { callback.raw() as usize };
 
     match event_name.as_str() {
       "buttonpressed" => {
-        if self.button_pressed_listeners.contains_key(&callback_ptr) {
-          self.button_pressed_listeners.remove(&callback_ptr);
-        }
+        self.button_pressed_listeners.remove(&callback_ptr);
       }
       "positionchanged" => {
-        if self
-          .playback_position_changed_listeners
-          .contains_key(&callback_ptr)
-        {
-          self
-            .playback_position_changed_listeners
-            .remove(&callback_ptr);
-        }
+        self.playback_position_changed_listeners.remove(&callback_ptr);
       }
       "positionseeked" => {
-        if self
-          .playback_position_seeked_listeners
-          .contains_key(&callback_ptr)
-        {
-          self
-            .playback_position_seeked_listeners
-            .remove(&callback_ptr);
-        }
+        self.playback_position_seeked_listeners.remove(&callback_ptr);
       }
       _ => {}
-    };
+    }
 
     Ok(())
   }
@@ -417,7 +544,7 @@ impl MediaPlayer {
   pub fn set_thumbnail(&mut self, thumbnail: &MediaPlayerThumbnail) -> napi::Result<()> {
     self.update_title_data(
       TitleDataPatch {
-        thumbnail: Some(thumbnail.thumbnail.to_owned()),
+        thumbnail: Some(thumbnail.thumbnail.clone()),
         ..TitleDataPatch::default()
       },
       FlushMode::MetadataOnly,
@@ -442,7 +569,7 @@ impl MediaPlayer {
       ));
     }
 
-    let patch_result: PlaybackPatchResult = self.update_playback_state(PlaybackStatePatch {
+    let patch_result = self.update_playback_state(PlaybackStatePatch {
       duration: Some(duration),
       position: Some(position),
       ..PlaybackStatePatch::default()
@@ -452,7 +579,7 @@ impl MediaPlayer {
       return Ok(());
     }
 
-    let flush_mode: FlushMode = if patch_result.completed_track_transition {
+    let flush_mode = if patch_result.completed_track_transition {
       FlushMode::TrackChange
     } else {
       FlushMode::PlaybackOnly
@@ -465,20 +592,14 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_play_button_enabled(&self) -> napi::Result<bool> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_play);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_play, false))
   }
 
   /// Sets the play button enbled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_play_button_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut state) = self.state.write() {
-      state.can_play = enabled;
-    }
+    self.with_state_mut(|state| state.can_play = enabled);
     Ok(())
   }
 
@@ -486,20 +607,14 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_pause_button_enabled(&self) -> napi::Result<bool> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_pause);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_pause, false))
   }
 
   /// Sets the paused button enbled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_pause_button_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut state) = self.state.write() {
-      state.can_pause = enabled;
-    }
+    self.with_state_mut(|state| state.can_pause = enabled);
     Ok(())
   }
 
@@ -507,20 +622,14 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_stop_button_enabled(&self) -> napi::Result<bool> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_control);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_control, false))
   }
 
   /// Sets the paused button enbled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_stop_button_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut state) = self.state.write() {
-      state.can_control = enabled;
-    }
+    self.with_state_mut(|state| state.can_control = enabled);
     Ok(())
   }
 
@@ -528,20 +637,14 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_previous_button_enabled(&self) -> napi::Result<bool> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_go_previous);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_go_previous, false))
   }
 
   /// Sets the previous button enbled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_previous_button_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut state) = self.state.write() {
-      state.can_go_previous = enabled;
-    }
+    self.with_state_mut(|state| state.can_go_previous = enabled);
     Ok(())
   }
 
@@ -549,20 +652,14 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_next_button_enabled(&self) -> napi::Result<bool> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_go_next);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_go_next, false))
   }
 
   /// Sets the next button enbled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_next_button_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut state) = self.state.write() {
-      state.can_go_next = enabled;
-    }
+    self.with_state_mut(|state| state.can_go_next = enabled);
     Ok(())
   }
 
@@ -570,20 +667,14 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_seek_enabled(&self) -> napi::Result<bool> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_seek);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_seek, false))
   }
 
   /// Sets the seek enabled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_seek_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut state) = self.state.write() {
-      state.can_seek = enabled;
-    }
+    self.with_state_mut(|state| state.can_seek = enabled);
     Ok(())
   }
 
@@ -591,20 +682,14 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_playback_rate(&self) -> napi::Result<f64> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.playback_rate);
-    }
-
-    Ok(1.0)
+    Ok(self.read_state(|state| state.playback_rate, 1.0))
   }
 
   /// Sets the playback rate
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_playback_rate(&mut self, playback_rate: f64) -> napi::Result<()> {
-    if let Ok(mut state) = self.state.write() {
-      state.playback_rate = playback_rate;
-    }
+    self.with_state_mut(|state| state.playback_rate = playback_rate);
     Ok(())
   }
 
@@ -612,11 +697,10 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_playback_status(&self) -> napi::Result<MediaPlayerPlaybackStatus> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.playback_status);
-    }
-
-    Ok(MediaPlayerPlaybackStatus::Unknown)
+    Ok(self.read_state(
+      |state| state.playback_status,
+      MediaPlayerPlaybackStatus::Unknown,
+    ))
   }
 
   /// Sets the playback status
@@ -633,7 +717,7 @@ impl MediaPlayer {
       )));
     }
 
-    let patch_result: PlaybackPatchResult = self.update_playback_state(PlaybackStatePatch {
+    let patch_result = self.update_playback_state(PlaybackStatePatch {
       playback_status: Some(playback_status),
       ..PlaybackStatePatch::default()
     });
@@ -647,11 +731,7 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_media_type(&self) -> napi::Result<MediaPlayerMediaType> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.media_type);
-    }
-
-    Ok(MediaPlayerMediaType::Unknown)
+    Ok(self.read_state(|state| state.media_type, MediaPlayerMediaType::Unknown))
   }
 
   /// Sets the media type
@@ -665,10 +745,7 @@ impl MediaPlayer {
       )));
     }
 
-    if let Ok(mut state) = self.state.write() {
-      state.media_type = media_type;
-    }
-
+    self.with_state_mut(|state| state.media_type = media_type);
     Ok(())
   }
 
@@ -676,11 +753,7 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_title(&self) -> napi::Result<String> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.title.to_owned());
-    }
-
-    Ok(String::new())
+    Ok(self.read_state(|state| state.title.clone(), String::new()))
   }
 
   /// Sets the media title
@@ -700,11 +773,7 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_artist(&self) -> napi::Result<String> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.artist.to_owned());
-    }
-
-    Ok(String::new())
+    Ok(self.read_state(|state| state.artist.clone(), String::new()))
   }
 
   /// Sets the media artist
@@ -724,11 +793,7 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_album_title(&self) -> napi::Result<String> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.album_title.to_owned());
-    }
-
-    Ok(String::new())
+    Ok(self.read_state(|state| state.album_title.clone(), String::new()))
   }
 
   /// Sets the media artist
@@ -748,11 +813,7 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_track_id(&self) -> napi::Result<String> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.track_id.to_owned());
-    }
-
-    Ok(String::new())
+    Ok(self.read_state(|state| state.track_id.clone(), String::new()))
   }
 
   /// Sets the track id
@@ -768,68 +829,28 @@ impl MediaPlayer {
     )
   }
 
-  #[allow(dead_code)]
-  fn publish_state(&mut self) -> napi::Result<()> {
-    self.flush_state(FlushMode::Full)
+  fn read_state<T>(&self, mapper: impl FnOnce(&MediaPlayerState) -> T, fallback: T) -> T {
+    self
+      .state
+      .read()
+      .map(|state| mapper(&state))
+      .unwrap_or(fallback)
   }
 
-  #[allow(dead_code)]
-  fn update_metadata(&mut self) -> napi::Result<()> {
-    self.flush_state(FlushMode::MetadataOnly)
-  }
-
-  #[allow(dead_code)]
-  fn update_playback(&mut self) -> napi::Result<()> {
-    self.flush_state(FlushMode::PlaybackOnly)
+  fn with_state_mut(&self, mapper: impl FnOnce(&mut MediaPlayerState)) {
+    if let Ok(mut state) = self.state.write() {
+      mapper(&mut state);
+    }
   }
 
   fn update_title_data(&mut self, patch: TitleDataPatch, flush_mode: FlushMode) -> napi::Result<()> {
-    let mut did_change: bool = false;
-    if let Ok(mut state) = self.state.write() {
-      if let Some(title) = patch.title {
-        if state.title != title {
-          state.title = title;
-          did_change = true;
-        }
-      }
-      if let Some(artist) = patch.artist {
-        if state.artist != artist {
-          state.artist = artist;
-          did_change = true;
-        }
-      }
-      if let Some(album_title) = patch.album_title {
-        if state.album_title != album_title {
-          state.album_title = album_title;
-          did_change = true;
-        }
-      }
-      if let Some(thumbnail) = patch.thumbnail {
-        if state.thumbnail != thumbnail {
-          state.thumbnail = thumbnail;
-          did_change = true;
-        }
-      }
-      if let Some(track_id) = patch.track_id {
-        if state.track_id != track_id {
-          state.track_id = track_id;
-          state.track_revision = state.track_revision.saturating_add(1);
-          state.track_transition_pending = true;
-          state.duration = 0.0;
-          state.position = 0.0;
-          state.playback_dirty = true;
-          state.prefer_last_playback_position_for_status_flush = false;
-          did_change = true;
-        }
-      }
+    let changed = self
+      .state
+      .write()
+      .map(|mut state| state.apply_title_patch(patch))
+      .unwrap_or(false);
 
-      if did_change {
-        state.state_revision = state.state_revision.saturating_add(1);
-        state.metadata_dirty = true;
-      }
-    }
-
-    if !did_change {
+    if !changed {
       return Ok(());
     }
 
@@ -837,155 +858,45 @@ impl MediaPlayer {
   }
 
   fn update_playback_state(&mut self, patch: PlaybackStatePatch) -> PlaybackPatchResult {
-    if let Ok(mut state) = self.state.write() {
-      let mut playback_changed: bool = false;
-      let mut duration_changed: bool = false;
-      let mut playback_status_changed: bool = false;
-      let mut completed_track_transition: bool = false;
-
-      if let Some(duration) = patch.duration {
-        if (state.duration - duration).abs() > f64::EPSILON {
-          state.duration = duration;
-          duration_changed = true;
-        }
-      }
-
-      if let Some(position) = patch.position {
-        if (state.position - position).abs() > f64::EPSILON {
-          state.position = position;
-          playback_changed = true;
-        }
-      }
-
-      if let Some(playback_status) = patch.playback_status {
-        if state.playback_status != playback_status {
-          state.playback_status = playback_status;
-          playback_status_changed = true;
-          playback_changed = true;
-        }
-      }
-
-      if duration_changed {
-        state.metadata_dirty = true;
-        playback_changed = true;
-      }
-
-      if state.track_transition_pending && (duration_changed || patch.position.is_some()) {
-        state.position_event_track_revision = state.track_revision;
-        state.track_transition_pending = false;
-        completed_track_transition = true;
-      }
-
-      if patch.position.is_some() || duration_changed {
-        state.prefer_last_playback_position_for_status_flush = false;
-      } else if playback_status_changed {
-        state.prefer_last_playback_position_for_status_flush = true;
-      }
-
-      if playback_changed {
-        state.state_revision = state.state_revision.saturating_add(1);
-        state.playback_dirty = true;
-      }
-
-      return PlaybackPatchResult {
-        changed: playback_changed,
-        completed_track_transition,
-      };
-    }
-
-    PlaybackPatchResult {
-      changed: false,
-      completed_track_transition: false,
-    }
+    self
+      .state
+      .write()
+      .map(|mut state| state.apply_playback_patch(patch))
+      .unwrap_or(PlaybackPatchResult {
+        changed: false,
+        completed_track_transition: false,
+      })
   }
 
   fn flush_state(&mut self, flush_mode: FlushMode) -> napi::Result<()> {
-    let payload: Option<FlushPayload> = self.create_flush_payload(flush_mode);
-    let Some(payload) = payload else {
+    let Some(payload) = self
+      .state
+      .read()
+      .ok()
+      .and_then(|state| state.create_flush_payload(flush_mode))
+    else {
       return Ok(());
     };
 
     if let Some(metadata_snapshot) = payload.metadata.clone() {
       self.send_metadata(&metadata_snapshot)?;
-      self.mark_metadata_flushed(payload.state_revision, metadata_snapshot);
+      self.with_state_mut(|state| {
+        state.mark_metadata_flushed(payload.state_revision, metadata_snapshot);
+      });
     }
 
     if let Some(playback_snapshot) = payload.playback.clone() {
       self.send_playback(&playback_snapshot)?;
-      self.mark_playback_flushed(payload.state_revision, playback_snapshot);
+      self.with_state_mut(|state| {
+        state.mark_playback_flushed(payload.state_revision, playback_snapshot);
+      });
     }
 
     Ok(())
   }
 
-  fn create_flush_payload(&self, flush_mode: FlushMode) -> Option<FlushPayload> {
-    if let Ok(state) = self.state.read() {
-      if !state.active {
-        return None;
-      }
-
-      let metadata_requested: bool = matches!(
-        flush_mode,
-        FlushMode::Full | FlushMode::TrackChange | FlushMode::MetadataOnly
-      );
-      let playback_requested: bool = matches!(
-        flush_mode,
-        FlushMode::Full | FlushMode::TrackChange | FlushMode::PlaybackOnly
-      );
-
-      let metadata_snapshot: MetadataSnapshot = MetadataSnapshot {
-        title: state.title.clone(),
-        album_title: state.album_title.clone(),
-        artist: state.artist.clone(),
-        thumbnail: state.thumbnail.clone(),
-        duration: state.duration.max(0.0),
-      };
-      let playback_position: f64 = if state.prefer_last_playback_position_for_status_flush
-        && !state.track_transition_pending
-      {
-        state
-          .last_playback_snapshot
-          .as_ref()
-          .map_or_else(|| state.position.max(0.0), |snapshot| snapshot.position.max(0.0))
-      } else {
-        state.position.max(0.0)
-      };
-      let playback_snapshot: PlaybackSnapshot = PlaybackSnapshot {
-        playback_status: state.playback_status,
-        position: playback_position,
-      };
-
-      let should_emit_metadata: bool = metadata_requested
-        && (state.metadata_dirty
-          || state.last_metadata_snapshot.as_ref() != Some(&metadata_snapshot));
-      let should_emit_playback: bool = playback_requested
-        && (state.playback_dirty
-          || state.last_playback_snapshot.as_ref() != Some(&playback_snapshot));
-
-      if !should_emit_metadata && !should_emit_playback {
-        return None;
-      }
-
-      return Some(FlushPayload {
-        state_revision: state.state_revision,
-        metadata: if should_emit_metadata {
-          Some(metadata_snapshot)
-        } else {
-          None
-        },
-        playback: if should_emit_playback {
-          Some(playback_snapshot)
-        } else {
-          None
-        },
-      });
-    }
-
-    None
-  }
-
   fn send_metadata(&mut self, metadata_snapshot: &MetadataSnapshot) -> napi::Result<()> {
-    let metadata: MediaMetadata<'_> = MediaMetadata {
+    let metadata = MediaMetadata {
       title: to_optional_ref(metadata_snapshot.title.as_str()),
       album: to_optional_ref(metadata_snapshot.album_title.as_str()),
       artist: to_optional_ref(metadata_snapshot.artist.as_str()),
@@ -1000,9 +911,10 @@ impl MediaPlayer {
   }
 
   fn send_playback(&mut self, playback_snapshot: &PlaybackSnapshot) -> napi::Result<()> {
-    let progress: Option<MediaPosition> =
-      Some(MediaPosition(Duration::from_secs_f64(playback_snapshot.position)));
-    let playback: MediaPlayback = match playback_snapshot.playback_status {
+    let progress = Some(MediaPosition(Duration::from_secs_f64(
+      playback_snapshot.position,
+    )));
+    let playback = match playback_snapshot.playback_status {
       MediaPlayerPlaybackStatus::Playing => MediaPlayback::Playing { progress },
       MediaPlayerPlaybackStatus::Paused => MediaPlayback::Paused { progress },
       _ => MediaPlayback::Stopped,
@@ -1012,192 +924,6 @@ impl MediaPlayer {
       .media_controls
       .set_playback(playback)
       .map_err(map_souvlaki_error)
-  }
-
-  fn mark_metadata_flushed(&self, state_revision: u64, metadata_snapshot: MetadataSnapshot) {
-    if let Ok(mut state) = self.state.write() {
-      state.last_metadata_snapshot = Some(metadata_snapshot);
-      if state.state_revision == state_revision {
-        state.metadata_dirty = false;
-      }
-    }
-  }
-
-  fn mark_playback_flushed(&self, state_revision: u64, playback_snapshot: PlaybackSnapshot) {
-    if let Ok(mut state) = self.state.write() {
-      state.last_playback_snapshot = Some(playback_snapshot);
-      if state.state_revision == state_revision {
-        state.playback_dirty = false;
-        state.prefer_last_playback_position_for_status_flush = false;
-      }
-    }
-  }
-
-  #[cfg(test)]
-  fn test_apply_title_data_patch(
-    state: &mut MediaPlayerState,
-    patch: TitleDataPatch,
-  ) -> bool {
-    let mut did_change: bool = false;
-    if let Some(title) = patch.title {
-      if state.title != title {
-        state.title = title;
-        did_change = true;
-      }
-    }
-    if let Some(artist) = patch.artist {
-      if state.artist != artist {
-        state.artist = artist;
-        did_change = true;
-      }
-    }
-    if let Some(album_title) = patch.album_title {
-      if state.album_title != album_title {
-        state.album_title = album_title;
-        did_change = true;
-      }
-    }
-    if let Some(thumbnail) = patch.thumbnail {
-      if state.thumbnail != thumbnail {
-        state.thumbnail = thumbnail;
-        did_change = true;
-      }
-    }
-    if let Some(track_id) = patch.track_id {
-      if state.track_id != track_id {
-        state.track_id = track_id;
-        state.track_revision = state.track_revision.saturating_add(1);
-        state.track_transition_pending = true;
-        state.duration = 0.0;
-        state.position = 0.0;
-        state.playback_dirty = true;
-        state.prefer_last_playback_position_for_status_flush = false;
-        did_change = true;
-      }
-    }
-    if did_change {
-      state.metadata_dirty = true;
-      state.state_revision = state.state_revision.saturating_add(1);
-    }
-    did_change
-  }
-
-  #[cfg(test)]
-  fn test_apply_playback_state_patch(
-    state: &mut MediaPlayerState,
-    patch: PlaybackStatePatch,
-  ) -> PlaybackPatchResult {
-    let mut playback_changed: bool = false;
-    let mut duration_changed: bool = false;
-    let mut playback_status_changed: bool = false;
-    let mut completed_track_transition: bool = false;
-
-    if let Some(duration) = patch.duration {
-      if (state.duration - duration).abs() > f64::EPSILON {
-        state.duration = duration;
-        duration_changed = true;
-      }
-    }
-    if let Some(position) = patch.position {
-      if (state.position - position).abs() > f64::EPSILON {
-        state.position = position;
-        playback_changed = true;
-      }
-    }
-    if let Some(playback_status) = patch.playback_status {
-      if state.playback_status != playback_status {
-        state.playback_status = playback_status;
-        playback_status_changed = true;
-        playback_changed = true;
-      }
-    }
-    if duration_changed {
-      state.metadata_dirty = true;
-      playback_changed = true;
-    }
-    if state.track_transition_pending && (duration_changed || patch.position.is_some()) {
-      state.position_event_track_revision = state.track_revision;
-      state.track_transition_pending = false;
-      completed_track_transition = true;
-    }
-    if patch.position.is_some() || duration_changed {
-      state.prefer_last_playback_position_for_status_flush = false;
-    } else if playback_status_changed {
-      state.prefer_last_playback_position_for_status_flush = true;
-    }
-    if playback_changed {
-      state.playback_dirty = true;
-      state.state_revision = state.state_revision.saturating_add(1);
-    }
-    PlaybackPatchResult {
-      changed: playback_changed,
-      completed_track_transition,
-    }
-  }
-
-  #[cfg(test)]
-  fn test_should_accept_set_position(state: &MediaPlayerState, requested_seconds: f64) -> bool {
-    requested_seconds <= state.duration
-      && state.can_seek
-      && state.position_event_track_revision == state.track_revision
-  }
-
-  #[cfg(test)]
-  fn test_should_emit_metadata(
-    state: &MediaPlayerState,
-    metadata_snapshot: &MetadataSnapshot,
-    flush_mode: FlushMode,
-  ) -> bool {
-    let metadata_requested: bool = matches!(
-      flush_mode,
-      FlushMode::Full | FlushMode::TrackChange | FlushMode::MetadataOnly
-    );
-    metadata_requested
-      && (state.metadata_dirty || state.last_metadata_snapshot.as_ref() != Some(metadata_snapshot))
-  }
-
-  #[cfg(test)]
-  fn test_should_emit_playback(
-    state: &MediaPlayerState,
-    playback_snapshot: &PlaybackSnapshot,
-    flush_mode: FlushMode,
-  ) -> bool {
-    let playback_requested: bool = matches!(
-      flush_mode,
-      FlushMode::Full | FlushMode::TrackChange | FlushMode::PlaybackOnly
-    );
-    playback_requested
-      && (state.playback_dirty || state.last_playback_snapshot.as_ref() != Some(playback_snapshot))
-  }
-
-  #[cfg(test)]
-  fn test_metadata_snapshot_from_state(state: &MediaPlayerState) -> MetadataSnapshot {
-    MetadataSnapshot {
-      title: state.title.clone(),
-      album_title: state.album_title.clone(),
-      artist: state.artist.clone(),
-      thumbnail: state.thumbnail.clone(),
-      duration: state.duration.max(0.0),
-    }
-  }
-
-  #[cfg(test)]
-  fn test_playback_snapshot_from_state(state: &MediaPlayerState) -> PlaybackSnapshot {
-    let playback_position: f64 = if state.prefer_last_playback_position_for_status_flush
-      && !state.track_transition_pending
-    {
-      state
-        .last_playback_snapshot
-        .as_ref()
-        .map_or_else(|| state.position.max(0.0), |snapshot| snapshot.position.max(0.0))
-    } else {
-      state.position.max(0.0)
-    };
-
-    PlaybackSnapshot {
-      playback_status: state.playback_status,
-      position: playback_position,
-    }
   }
 }
 
@@ -1214,15 +940,9 @@ impl ObjectFinalize for MediaPlayer {
 fn handle_media_control_event(
   event: MediaControlEvent,
   state: &Arc<RwLock<MediaPlayerState>>,
-  button_pressed_listeners: &Arc<
-    DashMap<usize, ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>,
-  >,
-  playback_position_changed_listeners: &Arc<
-    DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>,
-  >,
-  playback_position_seeked_listeners: &Arc<
-    DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>,
-  >,
+  button_pressed_listeners: &ButtonListeners,
+  playback_position_changed_listeners: &PositionListeners,
+  playback_position_seeked_listeners: &PositionListeners,
 ) {
   let Ok(current_state) = state.read() else {
     return;
@@ -1234,70 +954,112 @@ fn handle_media_control_event(
 
   match event {
     MediaControlEvent::Play if current_state.can_play => {
-      emit_button_pressed(button_pressed_listeners, "play");
+      emit_string(button_pressed_listeners, "play");
     }
     MediaControlEvent::Pause if current_state.can_pause => {
-      emit_button_pressed(button_pressed_listeners, "pause");
+      emit_string(button_pressed_listeners, "pause");
     }
     MediaControlEvent::Toggle if current_state.can_play || current_state.can_pause => {
-      emit_button_pressed(button_pressed_listeners, "playpause");
+      emit_string(button_pressed_listeners, "playpause");
     }
     MediaControlEvent::Next if current_state.can_go_next => {
-      emit_button_pressed(button_pressed_listeners, "next");
+      emit_string(button_pressed_listeners, "next");
     }
     MediaControlEvent::Previous if current_state.can_go_previous => {
-      emit_button_pressed(button_pressed_listeners, "previous");
+      emit_string(button_pressed_listeners, "previous");
     }
     MediaControlEvent::Stop if current_state.can_control => {
-      emit_button_pressed(button_pressed_listeners, "stop");
+      emit_string(button_pressed_listeners, "stop");
+    }
+    MediaControlEvent::Seek(direction) if current_state.can_seek => {
+      emit_f64(
+        playback_position_seeked_listeners,
+        signed_seek_seconds(direction, DEFAULT_SEEK_STEP_SECS),
+      );
     }
     MediaControlEvent::SeekBy(direction, amount) if current_state.can_seek => {
-      let signed_seconds: f64 = match direction {
-        SeekDirection::Forward => amount.as_secs_f64(),
-        SeekDirection::Backward => -amount.as_secs_f64(),
-      };
-      emit_seek(playback_position_seeked_listeners, signed_seconds);
+      emit_f64(
+        playback_position_seeked_listeners,
+        signed_seek_seconds(direction, amount.as_secs_f64()),
+      );
     }
-    MediaControlEvent::SetPosition(position) if current_state.can_seek => {
-      let requested_seconds: f64 = position.0.as_secs_f64();
-      let is_track_context_current: bool =
-        current_state.position_event_track_revision == current_state.track_revision;
-      if requested_seconds <= current_state.duration && is_track_context_current {
-        emit_position(playback_position_changed_listeners, requested_seconds);
+    MediaControlEvent::SetPosition(position) => {
+      let requested_seconds = position.0.as_secs_f64();
+      if current_state.accepts_set_position(requested_seconds) {
+        emit_f64(playback_position_changed_listeners, requested_seconds);
       }
     }
     _ => {}
   }
 }
 
-fn emit_button_pressed(
-  listeners: &Arc<DashMap<usize, ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>>,
-  button: &str,
-) {
+fn insert_string_listener(
+  listeners: &ButtonListeners,
+  env: Env,
+  callback_ptr: usize,
+  callback: JsFunction,
+) -> napi::Result<()> {
+  if listeners.contains_key(&callback_ptr) {
+    return Ok(());
+  }
+
+  let mut threadsafe_callback =
+    callback.create_threadsafe_function(0, |ctx| {
+      ctx.env.create_string_from_std(ctx.value).map(|v| vec![v])
+    })?;
+  let _ = threadsafe_callback.unref(&env)?;
+  listeners.insert(callback_ptr, threadsafe_callback);
+  Ok(())
+}
+
+fn insert_f64_listener(
+  listeners: &PositionListeners,
+  env: Env,
+  callback_ptr: usize,
+  callback: JsFunction,
+) -> napi::Result<()> {
+  if listeners.contains_key(&callback_ptr) {
+    return Ok(());
+  }
+
+  let mut threadsafe_callback =
+    callback.create_threadsafe_function(0, |ctx| ctx.env.create_double(ctx.value).map(|v| vec![v]))?;
+  let _ = threadsafe_callback.unref(&env)?;
+  listeners.insert(callback_ptr, threadsafe_callback);
+  Ok(())
+}
+
+fn emit_string(listeners: &ButtonListeners, value: &str) {
   for listener in listeners.iter() {
     listener.call(
-      Ok(button.to_string()),
+      Ok(value.to_string()),
       ThreadsafeFunctionCallMode::NonBlocking,
     );
   }
 }
 
-fn emit_position(
-  listeners: &Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>,
-  position: f64,
-) {
+fn emit_f64(listeners: &PositionListeners, value: f64) {
   for listener in listeners.iter() {
-    listener.call(Ok(position), ThreadsafeFunctionCallMode::NonBlocking);
+    listener.call(Ok(value), ThreadsafeFunctionCallMode::NonBlocking);
   }
 }
 
-fn emit_seek(
-  listeners: &Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>,
-  seek_delta: f64,
-) {
-  for listener in listeners.iter() {
-    listener.call(Ok(seek_delta), ThreadsafeFunctionCallMode::NonBlocking);
+fn signed_seek_seconds(direction: SeekDirection, amount: f64) -> f64 {
+  match direction {
+    SeekDirection::Forward => amount,
+    SeekDirection::Backward => -amount,
   }
+}
+
+fn assign_if_changed(target: &mut String, next: Option<String>) -> bool {
+  let Some(next) = next else {
+    return false;
+  };
+  if *target == next {
+    return false;
+  }
+  *target = next;
+  true
 }
 
 fn to_optional_ref(value: &str) -> Option<&str> {
@@ -1308,11 +1070,14 @@ fn to_optional_ref(value: &str) -> Option<&str> {
   }
 }
 
+fn map_souvlaki_error(error: souvlaki::Error) -> napi::Error {
+  napi::Error::from_reason(format!("{:?}", error))
+}
+
 #[cfg(test)]
 mod tests {
   use super::{
-    FlushMode, MediaPlayer, MediaPlayerPlaybackStatus, MediaPlayerState, MetadataSnapshot,
-    PlaybackSnapshot, PlaybackStatePatch, TitleDataPatch,
+    FlushMode, MediaPlayerPlaybackStatus, MediaPlayerState, PlaybackStatePatch, TitleDataPatch,
   };
 
   fn build_test_state() -> MediaPlayerState {
@@ -1326,50 +1091,27 @@ mod tests {
       can_control: true,
       media_type: super::MediaPlayerMediaType::Music,
       playback_status: MediaPlayerPlaybackStatus::Paused,
-      thumbnail: String::new(),
-      artist: String::new(),
-      album_title: String::new(),
-      title: String::new(),
-      track_id: String::new(),
-      duration: 0.0,
-      position: 0.0,
-      playback_rate: 1.0,
-      state_revision: 0,
-      track_revision: 0,
-      position_event_track_revision: 0,
-      track_transition_pending: false,
-      prefer_last_playback_position_for_status_flush: false,
-      metadata_dirty: false,
-      playback_dirty: false,
-      last_metadata_snapshot: None,
-      last_playback_snapshot: None,
+      ..MediaPlayerState::default()
     }
   }
 
   #[test]
   fn track_transition_is_completed_by_timeline_patch() {
-    let mut state: MediaPlayerState = build_test_state();
+    let mut state = build_test_state();
 
-    let title_changed: bool = MediaPlayer::test_apply_title_data_patch(
-      &mut state,
-      TitleDataPatch {
-        track_id: Some(String::from("track-2")),
-        ..TitleDataPatch::default()
-      },
-    );
-    assert!(title_changed);
+    assert!(state.apply_title_patch(TitleDataPatch {
+      track_id: Some(String::from("track-2")),
+      ..TitleDataPatch::default()
+    }));
     assert!(state.track_transition_pending);
     assert_eq!(state.track_revision, 1);
     assert_eq!(state.position_event_track_revision, 0);
 
-    let playback_result = MediaPlayer::test_apply_playback_state_patch(
-      &mut state,
-      PlaybackStatePatch {
-        duration: Some(200.0),
-        position: Some(0.0),
-        ..PlaybackStatePatch::default()
-      },
-    );
+    let playback_result = state.apply_playback_patch(PlaybackStatePatch {
+      duration: Some(200.0),
+      position: Some(0.0),
+      ..PlaybackStatePatch::default()
+    });
 
     assert!(playback_result.completed_track_transition);
     assert_eq!(state.position_event_track_revision, state.track_revision);
@@ -1378,105 +1120,90 @@ mod tests {
 
   #[test]
   fn set_position_is_rejected_for_stale_track_context() {
-    let mut state: MediaPlayerState = build_test_state();
+    let mut state = build_test_state();
     state.track_revision = 2;
     state.position_event_track_revision = 1;
     state.duration = 120.0;
-    state.can_seek = true;
 
-    assert!(!MediaPlayer::test_should_accept_set_position(&state, 12.0));
+    assert!(!state.accepts_set_position(12.0));
 
     state.position_event_track_revision = 2;
-    assert!(MediaPlayer::test_should_accept_set_position(&state, 12.0));
+    assert!(state.accepts_set_position(12.0));
   }
 
   #[test]
   fn metadata_flush_requires_dirty_or_changed_snapshot() {
-    let mut state: MediaPlayerState = build_test_state();
+    let mut state = build_test_state();
     state.title = String::from("Song");
     state.duration = 180.0;
 
-    let metadata_snapshot: MetadataSnapshot = MediaPlayer::test_metadata_snapshot_from_state(&state);
+    let metadata_snapshot = state.metadata_snapshot();
     state.last_metadata_snapshot = Some(metadata_snapshot.clone());
     state.metadata_dirty = false;
 
-    assert!(!MediaPlayer::test_should_emit_metadata(
-      &state,
-      &metadata_snapshot,
-      FlushMode::PlaybackOnly
-    ));
-    assert!(!MediaPlayer::test_should_emit_metadata(
-      &state,
-      &metadata_snapshot,
-      FlushMode::TrackChange
-    ));
+    assert!(!state.should_emit_metadata(&metadata_snapshot, FlushMode::PlaybackOnly));
+    assert!(!state.should_emit_metadata(&metadata_snapshot, FlushMode::TrackChange));
 
     state.metadata_dirty = true;
-    assert!(MediaPlayer::test_should_emit_metadata(
-      &state,
-      &metadata_snapshot,
-      FlushMode::TrackChange
-    ));
+    assert!(state.should_emit_metadata(&metadata_snapshot, FlushMode::TrackChange));
   }
 
   #[test]
   fn paused_playback_flush_uses_latest_position_snapshot() {
-    let mut state: MediaPlayerState = build_test_state();
+    let mut state = build_test_state();
     state.position = 55.0;
     state.playback_status = MediaPlayerPlaybackStatus::Playing;
-    state.last_playback_snapshot = Some(PlaybackSnapshot {
+    state.last_playback_snapshot = Some(super::PlaybackSnapshot {
       playback_status: MediaPlayerPlaybackStatus::Playing,
       position: 58.0,
     });
     state.playback_dirty = false;
 
-    let changed: bool = MediaPlayer::test_apply_playback_state_patch(
-      &mut state,
-      PlaybackStatePatch {
-        playback_status: Some(MediaPlayerPlaybackStatus::Paused),
-        ..PlaybackStatePatch::default()
-      },
-    )
-    .changed;
-    assert!(changed);
+    assert!(
+      state
+        .apply_playback_patch(PlaybackStatePatch {
+          playback_status: Some(MediaPlayerPlaybackStatus::Paused),
+          ..PlaybackStatePatch::default()
+        })
+        .changed
+    );
     assert!(state.prefer_last_playback_position_for_status_flush);
 
-    let playback_snapshot: PlaybackSnapshot = MediaPlayer::test_playback_snapshot_from_state(&state);
+    let playback_snapshot = state.playback_snapshot();
     assert_eq!(playback_snapshot.position, 58.0);
-    assert_eq!(playback_snapshot.playback_status, MediaPlayerPlaybackStatus::Paused);
-    assert!(MediaPlayer::test_should_emit_playback(
-      &state,
-      &playback_snapshot,
-      FlushMode::PlaybackOnly
-    ));
+    assert_eq!(
+      playback_snapshot.playback_status,
+      MediaPlayerPlaybackStatus::Paused
+    );
+    assert!(state.should_emit_playback(&playback_snapshot, FlushMode::PlaybackOnly));
   }
 
   #[test]
   fn track_change_resets_timeline_state_before_next_playback_flush() {
-    let mut state: MediaPlayerState = build_test_state();
+    let mut state = build_test_state();
     state.duration = 245.0;
     state.position = 182.0;
-    state.last_playback_snapshot = Some(PlaybackSnapshot {
+    state.last_playback_snapshot = Some(super::PlaybackSnapshot {
       playback_status: MediaPlayerPlaybackStatus::Playing,
       position: 182.0,
     });
 
-    let title_changed: bool = MediaPlayer::test_apply_title_data_patch(
-      &mut state,
-      TitleDataPatch {
-        track_id: Some(String::from("new-track")),
-        ..TitleDataPatch::default()
-      },
-    );
-
-    assert!(title_changed);
+    assert!(state.apply_title_patch(TitleDataPatch {
+      track_id: Some(String::from("new-track")),
+      ..TitleDataPatch::default()
+    }));
     assert_eq!(state.duration, 0.0);
     assert_eq!(state.position, 0.0);
     assert!(state.track_transition_pending);
   }
-}
 
-fn map_souvlaki_error(error: souvlaki::Error) -> napi::Error {
-  napi::Error::from_reason(format!("{:?}", error))
-}
+  #[test]
+  fn inactive_state_does_not_create_flush_payload() {
+    let mut state = build_test_state();
+    state.active = false;
+    state.metadata_dirty = true;
+    state.playback_dirty = true;
 
+    assert!(state.create_flush_payload(FlushMode::Full).is_none());
+  }
+}
