@@ -14,77 +14,72 @@ use dbus::{
 };
 use dbus_crossroads::Crossroads;
 
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RECONNECT_DELAY: Duration = Duration::from_millis(250);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+type RegisterRequest = (String, Crossroads, oneshot::Sender<bool>);
+type UnregisterRequest = (String, oneshot::Sender<bool>);
+
 pub struct DBusSession {
-  dbus_connection_handle: JoinHandle<()>,
-  register_name: mpsc::Sender<(String, Crossroads, oneshot::Sender<bool>)>,
-  unregister_name: mpsc::Sender<(String, oneshot::Sender<bool>)>,
+  _dbus_connection_handle: JoinHandle<()>,
+  register_name: mpsc::Sender<RegisterRequest>,
+  unregister_name: mpsc::Sender<UnregisterRequest>,
   emit_message: mpsc::Sender<Message>,
 }
 
 impl DBusSession {
   pub fn new() -> Self {
-    let (register_name_sender, register_name_receiver) =
-      mpsc::channel::<(String, Crossroads, oneshot::Sender<bool>)>();
-    let (unregister_name_sender, unregister_name_receiver) =
-      mpsc::channel::<(String, oneshot::Sender<bool>)>();
-    let (emit_message_sender, emit_message_receiver) = mpsc::channel::<Message>();
+    let (register_name, register_name_receiver) = mpsc::channel::<RegisterRequest>();
+    let (unregister_name, unregister_name_receiver) = mpsc::channel::<UnregisterRequest>();
+    let (emit_message, emit_message_receiver) = mpsc::channel::<Message>();
 
     let dbus_connection_handle = thread::spawn(move || {
       let mut media_player: Option<Crossroads> = None;
+
       loop {
-        let connection_result = Connection::new_session();
-        if let Ok(connection) = connection_result {
-          loop {
-            match register_name_receiver.try_recv() {
-              Ok((name, crossroads, response)) => {
-                if let Ok(request_name_reply) = connection.request_name(&name, false, true, true) {
-                  if request_name_reply == RequestNameReply::PrimaryOwner {
-                    media_player = Some(crossroads);
-                    let _ = response.send(true);
-                  } else {
-                    let _ = response.send(false);
-                  }
-                } else {
-                  let _ = response.send(false);
-                }
-                // }
-              }
-              _ => {}
+        let Ok(connection) = Connection::new_session() else {
+          thread::sleep(RECONNECT_DELAY);
+          continue;
+        };
+
+        loop {
+          if let Ok((name, crossroads, response)) = register_name_receiver.try_recv() {
+            let registered = connection
+              .request_name(&name, false, true, true)
+              .ok()
+              .is_some_and(|reply| reply == RequestNameReply::PrimaryOwner);
+
+            if registered {
+              media_player = Some(crossroads);
             }
-            match unregister_name_receiver.try_recv() {
-              Ok((name, response)) => {
-                if media_player.is_some() {
-                  media_player = None;
-                  if let Ok(release_name_reply) = connection.release_name(&name) {
-                    if release_name_reply == ReleaseNameReply::Released {
-                      let _ = response.send(true);
-                    } else {
-                      let _ = response.send(false);
-                    }
-                  } else {
-                    let _ = response.send(false);
-                  }
-                }
-              }
-              _ => {}
-            }
-            match emit_message_receiver.try_recv() {
-              Ok(message) => {
-                let _ = connection.send(message);
-              }
-              _ => {}
-            }
-            let _ = connection
-              .channel()
-              .read_write(Some(Duration::from_secs(0)));
-            loop {
-              if let Some(message) = connection.channel().pop_message() {
-                if let Some(crossroads) = media_player.as_mut() {
-                  let _ = crossroads.handle_message(message, &connection);
-                }
-              } else {
-                break;
-              }
+            let _ = response.send(registered);
+          }
+
+          if let Ok((name, response)) = unregister_name_receiver.try_recv() {
+            let released = if media_player.take().is_some() {
+              connection
+                .release_name(&name)
+                .ok()
+                .is_some_and(|reply| reply == ReleaseNameReply::Released)
+            } else {
+              false
+            };
+            let _ = response.send(released);
+          }
+
+          while let Ok(message) = emit_message_receiver.try_recv() {
+            let _ = connection.send(message);
+          }
+
+          if connection.channel().read_write(Some(POLL_INTERVAL)).is_err() {
+            media_player = None;
+            break;
+          }
+
+          while let Some(message) = connection.channel().pop_message() {
+            if let Some(crossroads) = media_player.as_mut() {
+              let _ = crossroads.handle_message(message, &connection);
             }
           }
         }
@@ -92,38 +87,50 @@ impl DBusSession {
     });
 
     Self {
-      dbus_connection_handle,
-      register_name: register_name_sender,
-      unregister_name: unregister_name_sender,
-      emit_message: emit_message_sender,
+      _dbus_connection_handle: dbus_connection_handle,
+      register_name,
+      unregister_name,
+      emit_message,
     }
   }
 
   pub fn register(&self, name: &String, crossroads: Crossroads) -> bool {
-    let name = format!("org.mpris.MediaPlayer2.{}", &name);
+    let bus_name = mpris_bus_name(name);
     let (response_sender, response_receiver) = oneshot::channel();
-    let _ = self
+    if self
       .register_name
-      .send((name.to_owned(), crossroads, response_sender));
-    match response_receiver.recv_timeout(Duration::from_secs(1)) {
-      Ok(result) => result,
-      _ => false,
+      .send((bus_name, crossroads, response_sender))
+      .is_err()
+    {
+      return false;
     }
+
+    response_receiver
+      .recv_timeout(REQUEST_TIMEOUT)
+      .unwrap_or(false)
   }
 
   pub fn unregister(&self, name: &String) -> bool {
-    let name = format!("org.mpris.MediaPlayer2.{}", &name);
+    let bus_name = mpris_bus_name(name);
     let (response_sender, response_receiver) = oneshot::channel();
-    let _ = self
+    if self
       .unregister_name
-      .send((name.to_owned(), response_sender));
-    match response_receiver.recv_timeout(Duration::from_secs(1)) {
-      Ok(result) => result,
-      _ => false,
+      .send((bus_name, response_sender))
+      .is_err()
+    {
+      return false;
     }
+
+    response_receiver
+      .recv_timeout(REQUEST_TIMEOUT)
+      .unwrap_or(false)
   }
 
   pub fn emit_message(&self, message: Message) {
     let _ = self.emit_message.send(message);
   }
+}
+
+fn mpris_bus_name(service_name: &str) -> String {
+  format!("org.mpris.MediaPlayer2.{}", service_name)
 }

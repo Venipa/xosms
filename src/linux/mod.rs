@@ -29,8 +29,14 @@ use self::dbus::{
   session::DBusSession,
 };
 
+const MPRIS_OBJECT_PATH: &str = "/org/mpris/MediaPlayer2";
+const NO_TRACK_PATH: &str = "/org/mpris/MediaPlayer2/TrackList/NoTrack";
+
+type ButtonListeners = Arc<DashMap<usize, ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>>;
+type PositionListeners = Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>;
+
 #[napi]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum MediaPlayerThumbnailType {
   Unknown = -1,
   File = 1,
@@ -38,14 +44,14 @@ pub enum MediaPlayerThumbnailType {
 }
 
 #[napi]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum MediaPlayerMediaType {
   Unknown = -1,
   Music = 1,
 }
 
 #[napi]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum MediaPlayerPlaybackStatus {
   Unknown = -1,
   Playing = 1,
@@ -68,18 +74,14 @@ impl MediaPlayerThumbnail {
     thumbnail: String,
   ) -> napi::Result<Self> {
     match thumbnail_type {
-      MediaPlayerThumbnailType::File => {
-        return Ok(Self {
-          thumbnail_type,
-          thumbnail: format!("file://{}", thumbnail),
-        });
-      }
-      MediaPlayerThumbnailType::Uri => {
-        return Ok(Self {
-          thumbnail_type,
-          thumbnail,
-        });
-      }
+      MediaPlayerThumbnailType::File => Ok(Self {
+        thumbnail_type,
+        thumbnail: format!("file://{}", thumbnail),
+      }),
+      MediaPlayerThumbnailType::Uri => Ok(Self {
+        thumbnail_type,
+        thumbnail,
+      }),
       _ => Err(napi::Error::from_reason(format!(
         "{:?} is not a valid MediaPlayerThumbnailType to create",
         thumbnail_type
@@ -94,15 +96,111 @@ impl MediaPlayerThumbnail {
   }
 }
 
+struct MprisPlayerState {
+  identity: String,
+  can_go_next: bool,
+  can_go_previous: bool,
+  can_play: bool,
+  can_pause: bool,
+  can_seek: bool,
+  can_control: bool,
+  media_type: MediaPlayerMediaType,
+  playback_status: MediaPlayerPlaybackStatus,
+  thumbnail: String,
+  artist: String,
+  album_title: String,
+  title: String,
+  track_id: String,
+  position: f64,
+  last_updated_position: Instant,
+  duration: f64,
+  volume: f64,
+  playback_rate: f64,
+}
+
+impl MprisPlayerState {
+  fn new(identity: String) -> Self {
+    Self {
+      identity,
+      can_go_next: false,
+      can_go_previous: false,
+      can_play: false,
+      can_pause: false,
+      can_seek: false,
+      can_control: true,
+      media_type: MediaPlayerMediaType::Unknown,
+      playback_status: MediaPlayerPlaybackStatus::Unknown,
+      thumbnail: String::new(),
+      artist: String::new(),
+      album_title: String::new(),
+      title: String::new(),
+      track_id: String::new(),
+      position: 0.0,
+      last_updated_position: Instant::now(),
+      duration: 0.0,
+      volume: 1.0,
+      playback_rate: 1.0,
+    }
+  }
+
+  fn track_object_path(&self) -> Path<'static> {
+    if self.track_id.is_empty() {
+      Path::from(NO_TRACK_PATH.to_string())
+    } else {
+      Path::from(format!("/xosms/trackid/{}", self.track_id))
+    }
+  }
+
+  fn playback_status_label(&self) -> &'static str {
+    match self.playback_status {
+      MediaPlayerPlaybackStatus::Playing => "Playing",
+      MediaPlayerPlaybackStatus::Paused => "Paused",
+      _ => "Stopped",
+    }
+  }
+
+  fn metadata_map(&self) -> PropMap {
+    let mut metadata = PropMap::new();
+    metadata.insert(
+      "mpris:trackid".to_string(),
+      Variant(Box::new(self.track_object_path())),
+    );
+    metadata.insert(
+      "mpris:length".to_string(),
+      Variant(Box::new(seconds_to_micros(self.duration))),
+    );
+    metadata.insert(
+      "mpris:artUrl".to_string(),
+      Variant(Box::new(self.thumbnail.clone())),
+    );
+    metadata.insert(
+      "xesam:title".to_string(),
+      Variant(Box::new(self.title.clone())),
+    );
+    metadata.insert(
+      "xesam:album".to_string(),
+      Variant(Box::new(self.album_title.clone())),
+    );
+    // MPRIS requires xesam:artist as an array of strings (`as`).
+    metadata.insert(
+      "xesam:artist".to_string(),
+      Variant(Box::new(vec![self.artist.clone()])),
+    );
+    metadata
+  }
+
+  fn should_emit_seeked(&self, next_position: f64) -> bool {
+    next_position - self.position > self.playback_rate
+      && self.last_updated_position.elapsed().as_secs() < 1
+  }
+}
+
 #[napi(custom_finalize)]
 struct MediaPlayer {
   service_name: String,
-  button_pressed_listeners:
-    Arc<DashMap<usize, ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>>,
-  playback_position_changed_listeners:
-    Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>,
-  playback_position_seeked_listeners:
-    Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>,
+  button_pressed_listeners: ButtonListeners,
+  playback_position_changed_listeners: PositionListeners,
+  playback_position_seeked_listeners: PositionListeners,
   player_state: Arc<RwLock<MprisPlayerState>>,
   properties_changed: PropertiesPropertiesChanged,
   active: bool,
@@ -114,43 +212,12 @@ impl MediaPlayer {
   #[napi(constructor)]
   #[allow(dead_code)]
   pub fn new(service_name: String, identity: String) -> napi::Result<Self> {
-    let button_pressed_listeners: Arc<
-      DashMap<usize, ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>,
-    > = Arc::new(DashMap::new());
-    let playback_position_changed_listeners: Arc<
-      DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>,
-    > = Arc::new(DashMap::new());
-    let playback_position_seeked_listeners: Arc<
-      DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>,
-    > = Arc::new(DashMap::new());
-    let mpris_player_state = Arc::new(RwLock::new(MprisPlayerState {
-      identity,
-      can_go_next: false,
-      can_go_previous: false,
-      can_play: false,
-      can_pause: false,
-      can_seek: false,
-      can_control: true,
-      media_type: MediaPlayerMediaType::Unknown,
-      playback_status: MediaPlayerPlaybackStatus::Unknown,
-      thumbnail: "".to_string(),
-      artist: "".to_string(),
-      album_title: "".to_string(),
-      title: "".to_string(),
-      track_id: "".to_string(),
-      position: 0.0,
-      last_updated_position: Instant::now(),
-      duration: 0.0,
-      volume: 1.0,
-      playback_rate: 1.0,
-    }));
-
     Ok(Self {
       service_name,
-      button_pressed_listeners,
-      playback_position_changed_listeners,
-      playback_position_seeked_listeners,
-      player_state: mpris_player_state,
+      button_pressed_listeners: Arc::new(DashMap::new()),
+      playback_position_changed_listeners: Arc::new(DashMap::new()),
+      playback_position_seeked_listeners: Arc::new(DashMap::new()),
+      player_state: Arc::new(RwLock::new(MprisPlayerState::new(identity))),
       properties_changed: PropertiesPropertiesChanged {
         interface_name: "org.mpris.MediaPlayer2.Player".to_string(),
         changed_properties: Default::default(),
@@ -170,12 +237,11 @@ impl MediaPlayer {
     }
 
     let mut crossroads = Crossroads::new();
-
     let mpris_iface_token = register_org_mpris_media_player2(&mut crossroads);
     let mpris_player_iface_token = register_org_mpris_media_player2_player(&mut crossroads);
 
     crossroads.insert(
-      "/org/mpris/MediaPlayer2",
+      MPRIS_OBJECT_PATH,
       &[mpris_iface_token, mpris_player_iface_token],
       MprisPlayer {
         button_pressed_listeners: self.button_pressed_listeners.clone(),
@@ -224,46 +290,22 @@ impl MediaPlayer {
 
     match event_name.as_str() {
       "buttonpressed" => {
-        if !self.button_pressed_listeners.contains_key(&callback_ptr) {
-          let mut threadsafe_callback = callback.create_threadsafe_function(0, |ctx| {
-            ctx.env.create_string_from_std(ctx.value).map(|v| vec![v])
-          })?;
-          let _ = threadsafe_callback.unref(&env)?;
-          self
-            .button_pressed_listeners
-            .insert(callback_ptr, threadsafe_callback);
-        }
+        insert_string_listener(&self.button_pressed_listeners, env, callback_ptr, callback)?
       }
-      "positionchanged" => {
-        if !self
-          .playback_position_changed_listeners
-          .contains_key(&callback_ptr)
-        {
-          let mut threadsafe_callback = callback.create_threadsafe_function(0, |ctx| {
-            ctx.env.create_double(ctx.value).map(|v| vec![v])
-          })?;
-          let _ = threadsafe_callback.unref(&env)?;
-          self
-            .playback_position_changed_listeners
-            .insert(callback_ptr, threadsafe_callback);
-        }
-      }
-      "positionseeked" => {
-        if !self
-          .playback_position_seeked_listeners
-          .contains_key(&callback_ptr)
-        {
-          let mut threadsafe_callback = callback.create_threadsafe_function(0, |ctx| {
-            ctx.env.create_double(ctx.value).map(|v| vec![v])
-          })?;
-          let _ = threadsafe_callback.unref(&env)?;
-          self
-            .playback_position_seeked_listeners
-            .insert(callback_ptr, threadsafe_callback);
-        }
-      }
+      "positionchanged" => insert_f64_listener(
+        &self.playback_position_changed_listeners,
+        env,
+        callback_ptr,
+        callback,
+      )?,
+      "positionseeked" => insert_f64_listener(
+        &self.playback_position_seeked_listeners,
+        env,
+        callback_ptr,
+        callback,
+      )?,
       _ => {}
-    };
+    }
 
     Ok(())
   }
@@ -281,32 +323,18 @@ impl MediaPlayer {
 
     match event_name.as_str() {
       "buttonpressed" => {
-        if self.button_pressed_listeners.contains_key(&callback_ptr) {
-          self.button_pressed_listeners.remove(&callback_ptr);
-        }
+        self.button_pressed_listeners.remove(&callback_ptr);
       }
       "positionchanged" => {
-        if self
+        self
           .playback_position_changed_listeners
-          .contains_key(&callback_ptr)
-        {
-          self
-            .playback_position_changed_listeners
-            .remove(&callback_ptr);
-        }
+          .remove(&callback_ptr);
       }
       "positionseeked" => {
-        if self
-          .playback_position_seeked_listeners
-          .contains_key(&callback_ptr)
-        {
-          self
-            .playback_position_seeked_listeners
-            .remove(&callback_ptr);
-        }
+        self.playback_position_seeked_listeners.remove(&callback_ptr);
       }
       _ => {}
-    };
+    }
 
     Ok(())
   }
@@ -344,14 +372,7 @@ impl MediaPlayer {
   #[napi]
   #[allow(dead_code)]
   pub fn update(&mut self) -> napi::Result<()> {
-    self.dbus_session.emit_message(
-      self
-        .properties_changed
-        .to_emit_message(&Path::new("/org/mpris/MediaPlayer2").unwrap()),
-    );
-    self.properties_changed.changed_properties.clear();
-    self.properties_changed.invalidated_properties.clear();
-
+    self.emit_properties_changed();
     Ok(())
   }
 
@@ -359,16 +380,10 @@ impl MediaPlayer {
   #[napi]
   #[allow(dead_code)]
   pub fn set_thumbnail(&mut self, thumbnail: &MediaPlayerThumbnail) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.thumbnail = thumbnail.thumbnail.to_owned();
-      drop(player_state);
-
-      let metadata = self.construct_metadata();
-      self
-        .properties_changed
-        .add_prop("Metadata", EmitsChangedSignal::True, || metadata);
-    }
-
+    self.with_state_mut(|state| {
+      state.thumbnail = thumbnail.thumbnail.clone();
+    });
+    self.queue_metadata_changed();
     Ok(())
   }
 
@@ -390,35 +405,28 @@ impl MediaPlayer {
       ));
     }
 
-    if let Ok(mut player_state) = self.player_state.write() {
-      // If the position moved more than the playback rate within 1 second of time then a seeked signal needs to be emitted
-      if position - player_state.position > player_state.playback_rate
-        && player_state.last_updated_position.elapsed().as_secs() < 1
-      {
-        let seeked = OrgMprisMediaPlayer2PlayerSeeked {
-          position: FloatDuration::seconds(position)
-            .as_microseconds()
-            .max(i64::MIN as f64)
-            .min(i64::MAX as f64)
-            .round() as i64,
-        };
-        self
-          .dbus_session
-          .emit_message(seeked.to_emit_message(&Path::new("/org/mpris/MediaPlayer2").unwrap()));
-      }
+    let emit_seeked = self
+      .player_state
+      .write()
+      .map(|mut state| {
+        let should_seek = state.should_emit_seeked(position);
+        state.duration = duration;
+        state.position = position;
+        state.last_updated_position = Instant::now();
+        should_seek
+      })
+      .unwrap_or(false);
 
-      player_state.duration = duration;
-      player_state.position = position;
-      player_state.last_updated_position = Instant::now();
-
-      drop(player_state);
-
-      let metadata = self.construct_metadata();
+    if emit_seeked {
+      let seeked = OrgMprisMediaPlayer2PlayerSeeked {
+        position: seconds_to_micros(position),
+      };
       self
-        .properties_changed
-        .add_prop("Metadata", EmitsChangedSignal::True, || metadata);
+        .dbus_session
+        .emit_message(seeked.to_emit_message(&mpris_path()));
     }
 
+    self.queue_metadata_changed();
     Ok(())
   }
 
@@ -426,26 +434,15 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_play_button_enabled(&self) -> napi::Result<bool> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.can_play);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_play, false))
   }
 
   /// Sets the play button enbled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_play_button_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.can_play = enabled;
-      drop(player_state);
-
-      self
-        .properties_changed
-        .add_prop("CanPlay", EmitsChangedSignal::True, || Box::new(enabled));
-    }
-
+    self.with_state_mut(|state| state.can_play = enabled);
+    self.queue_bool_prop("CanPlay", enabled);
     Ok(())
   }
 
@@ -453,26 +450,15 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_pause_button_enabled(&self) -> napi::Result<bool> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.can_pause);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_pause, false))
   }
 
   /// Sets the paused button enbled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_pause_button_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.can_pause = enabled;
-      drop(player_state);
-
-      self
-        .properties_changed
-        .add_prop("CanPause", EmitsChangedSignal::True, || Box::new(enabled));
-    }
-
+    self.with_state_mut(|state| state.can_pause = enabled);
+    self.queue_bool_prop("CanPause", enabled);
     Ok(())
   }
 
@@ -480,12 +466,8 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_stop_button_enabled(&self) -> napi::Result<bool> {
-    if let Ok(player_state) = self.player_state.read() {
-      // Stop button for MPRIS is tied to CanControl
-      return Ok(player_state.can_control);
-    }
-
-    Ok(false)
+    // Stop button for MPRIS is tied to CanControl
+    Ok(self.read_state(|state| state.can_control, false))
   }
 
   /// Sets the paused button enbled state
@@ -500,28 +482,15 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_previous_button_enabled(&self) -> napi::Result<bool> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.can_go_previous);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_go_previous, false))
   }
 
   /// Sets the previous button enbled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_previous_button_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.can_go_previous = enabled;
-      drop(player_state);
-
-      self
-        .properties_changed
-        .add_prop("CanGoPrevious", EmitsChangedSignal::True, || {
-          Box::new(enabled)
-        });
-    }
-
+    self.with_state_mut(|state| state.can_go_previous = enabled);
+    self.queue_bool_prop("CanGoPrevious", enabled);
     Ok(())
   }
 
@@ -529,26 +498,15 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_next_button_enabled(&self) -> napi::Result<bool> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.can_go_next);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_go_next, false))
   }
 
   /// Sets the next button enbled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_next_button_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.can_go_next = enabled;
-      drop(player_state);
-
-      self
-        .properties_changed
-        .add_prop("CanGoNext", EmitsChangedSignal::True, || Box::new(enabled));
-    }
-
+    self.with_state_mut(|state| state.can_go_next = enabled);
+    self.queue_bool_prop("CanGoNext", enabled);
     Ok(())
   }
 
@@ -556,26 +514,15 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_seek_enabled(&self) -> napi::Result<bool> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.can_seek);
-    }
-
-    Ok(false)
+    Ok(self.read_state(|state| state.can_seek, false))
   }
 
   /// Sets the seek enbled state
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_seek_enabled(&mut self, enabled: bool) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.can_seek = enabled;
-      drop(player_state);
-
-      self
-        .properties_changed
-        .add_prop("CanSeek", EmitsChangedSignal::True, || Box::new(enabled));
-    }
-
+    self.with_state_mut(|state| state.can_seek = enabled);
+    self.queue_bool_prop("CanSeek", enabled);
     Ok(())
   }
 
@@ -583,26 +530,17 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_playback_rate(&self) -> napi::Result<f64> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.playback_rate);
-    }
-
-    Ok(1.0)
+    Ok(self.read_state(|state| state.playback_rate, 1.0))
   }
 
   /// Sets the playback rate
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_playback_rate(&mut self, playback_rate: f64) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.playback_rate = playback_rate;
-      drop(player_state);
-
-      self
-        .properties_changed
-        .add_prop("Rate", EmitsChangedSignal::True, || Box::new(playback_rate));
-    }
-
+    self.with_state_mut(|state| state.playback_rate = playback_rate);
+    self
+      .properties_changed
+      .add_prop("Rate", EmitsChangedSignal::True, || Box::new(playback_rate));
     Ok(())
   }
 
@@ -610,11 +548,10 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_playback_status(&self) -> napi::Result<MediaPlayerPlaybackStatus> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.playback_status);
-    }
-
-    Ok(MediaPlayerPlaybackStatus::Unknown)
+    Ok(self.read_state(
+      |state| state.playback_status,
+      MediaPlayerPlaybackStatus::Unknown,
+    ))
   }
 
   /// Sets the playback status
@@ -631,24 +568,17 @@ impl MediaPlayer {
       )));
     }
 
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.playback_status = playback_status;
-      drop(player_state);
-
-      self
-        .properties_changed
-        .add_prop(
-          "PlaybackStatus",
-          EmitsChangedSignal::True,
-          || match playback_status {
-            MediaPlayerPlaybackStatus::Playing => Box::new("Playing".to_string()),
-            MediaPlayerPlaybackStatus::Paused => Box::new("Paused".to_string()),
-            MediaPlayerPlaybackStatus::Stopped => Box::new("Stopped".to_string()),
-            _ => Box::new("Stopped".to_string()),
-          },
-        );
-    }
-
+    self.with_state_mut(|state| state.playback_status = playback_status);
+    let label = match playback_status {
+      MediaPlayerPlaybackStatus::Playing => "Playing",
+      MediaPlayerPlaybackStatus::Paused => "Paused",
+      _ => "Stopped",
+    };
+    self
+      .properties_changed
+      .add_prop("PlaybackStatus", EmitsChangedSignal::True, || {
+        Box::new(label.to_string())
+      });
     Ok(())
   }
 
@@ -656,11 +586,7 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_media_type(&self) -> napi::Result<MediaPlayerMediaType> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.media_type);
-    }
-
-    Ok(MediaPlayerMediaType::Unknown)
+    Ok(self.read_state(|state| state.media_type, MediaPlayerMediaType::Unknown))
   }
 
   /// Sets the media type
@@ -674,11 +600,7 @@ impl MediaPlayer {
       )));
     }
 
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.media_type = media_type;
-      drop(player_state);
-    }
-
+    self.with_state_mut(|state| state.media_type = media_type);
     Ok(())
   }
 
@@ -686,27 +608,15 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_title(&self) -> napi::Result<String> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.title.to_owned());
-    }
-
-    Ok("".to_string())
+    Ok(self.read_state(|state| state.title.clone(), String::new()))
   }
 
   /// Sets the media title
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_title(&mut self, title: String) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.title = title;
-      drop(player_state);
-
-      let metadata = self.construct_metadata();
-      self
-        .properties_changed
-        .add_prop("Metadata", EmitsChangedSignal::True, || metadata);
-    }
-
+    self.with_state_mut(|state| state.title = title);
+    self.queue_metadata_changed();
     Ok(())
   }
 
@@ -714,27 +624,15 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_artist(&self) -> napi::Result<String> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.artist.to_owned());
-    }
-
-    Ok("".to_string())
+    Ok(self.read_state(|state| state.artist.clone(), String::new()))
   }
 
   /// Sets the media artist
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_artist(&mut self, artist: String) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.artist = artist;
-      drop(player_state);
-
-      let metadata = self.construct_metadata();
-      self
-        .properties_changed
-        .add_prop("Metadata", EmitsChangedSignal::True, || metadata);
-    }
-
+    self.with_state_mut(|state| state.artist = artist);
+    self.queue_metadata_changed();
     Ok(())
   }
 
@@ -742,27 +640,15 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_album_title(&self) -> napi::Result<String> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.album_title.to_owned());
-    }
-
-    Ok("".to_string())
+    Ok(self.read_state(|state| state.album_title.clone(), String::new()))
   }
 
   /// Sets the media artist
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_album_title(&mut self, album_title: String) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.album_title = album_title;
-      drop(player_state);
-
-      let metadata = self.construct_metadata();
-      self
-        .properties_changed
-        .add_prop("Metadata", EmitsChangedSignal::True, || metadata);
-    }
-
+    self.with_state_mut(|state| state.album_title = album_title);
+    self.queue_metadata_changed();
     Ok(())
   }
 
@@ -770,74 +656,55 @@ impl MediaPlayer {
   #[napi(getter)]
   #[allow(dead_code)]
   pub fn get_track_id(&self) -> napi::Result<String> {
-    if let Ok(player_state) = self.player_state.read() {
-      return Ok(player_state.track_id.to_owned());
-    }
-
-    Ok("".to_string())
+    Ok(self.read_state(|state| state.track_id.clone(), String::new()))
   }
 
   /// Sets the track id
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_track_id(&mut self, track_id: String) -> napi::Result<()> {
-    if let Ok(mut player_state) = self.player_state.write() {
-      player_state.track_id = track_id;
-      drop(player_state);
-
-      let metadata = self.construct_metadata();
-      self
-        .properties_changed
-        .add_prop("Metadata", EmitsChangedSignal::True, || metadata);
-    }
-
+    self.with_state_mut(|state| state.track_id = track_id);
+    self.queue_metadata_changed();
     Ok(())
   }
 
-  fn construct_metadata(&self) -> Box<PropMap> {
-    if let Ok(state) = self.player_state.read() {
-      let mut metadata = Box::new(PropMap::new());
-      if state.track_id == "" {
-        metadata.insert(
-          "mpris:trackid".to_string(),
-          Variant(Box::new("/org/mpris/MediaPlayer2/TrackList/NoTrack".to_string())),
-        );
-      } else {
-        metadata.insert(
-          "mpris:trackid".to_string(),
-          Variant(Box::new(format!("/xosms/trackid/{}", state.track_id))),
-        );
-      }
-      metadata.insert(
-        "mpris:length".to_string(),
-        Variant(Box::new(
-          FloatDuration::seconds(state.duration)
-            .as_microseconds()
-            .max(i64::MIN as f64)
-            .min(i64::MAX as f64)
-            .round() as i64,
-        )),
-      );
-      metadata.insert(
-        "mpris:artUrl".to_string(),
-        Variant(Box::new(state.thumbnail.to_owned())),
-      );
-      metadata.insert(
-        "xesam:title".to_string(),
-        Variant(Box::new(state.title.to_owned())),
-      );
-      metadata.insert(
-        "xesam:album".to_string(),
-        Variant(Box::new(state.album_title.to_owned())),
-      );
-      metadata.insert(
-        "xesam:artist".to_string(),
-        Variant(Box::new(state.artist.to_owned())),
-      );
-      return metadata;
-    }
+  fn read_state<T>(&self, mapper: impl FnOnce(&MprisPlayerState) -> T, fallback: T) -> T {
+    self
+      .player_state
+      .read()
+      .map(|state| mapper(&state))
+      .unwrap_or(fallback)
+  }
 
-    Box::new(PropMap::new())
+  fn with_state_mut(&self, mapper: impl FnOnce(&mut MprisPlayerState)) {
+    if let Ok(mut state) = self.player_state.write() {
+      mapper(&mut state);
+    }
+  }
+
+  fn queue_bool_prop(&mut self, name: &str, value: bool) {
+    self
+      .properties_changed
+      .add_prop(name, EmitsChangedSignal::True, || Box::new(value));
+  }
+
+  fn queue_metadata_changed(&mut self) {
+    let metadata = self
+      .player_state
+      .read()
+      .map(|state| Box::new(state.metadata_map()))
+      .unwrap_or_else(|_| Box::new(PropMap::new()));
+    self
+      .properties_changed
+      .add_prop("Metadata", EmitsChangedSignal::True, || metadata);
+  }
+
+  fn emit_properties_changed(&mut self) {
+    self
+      .dbus_session
+      .emit_message(self.properties_changed.to_emit_message(&mpris_path()));
+    self.properties_changed.changed_properties.clear();
+    self.properties_changed.invalidated_properties.clear();
   }
 }
 
@@ -848,422 +715,371 @@ impl ObjectFinalize for MediaPlayer {
   }
 }
 
-pub struct MprisPlayerState {
-  identity: String,
-  can_go_next: bool,
-  can_go_previous: bool,
-  can_play: bool,
-  can_pause: bool,
-  can_seek: bool,
-  can_control: bool,
-  media_type: MediaPlayerMediaType,
-  playback_status: MediaPlayerPlaybackStatus,
-  thumbnail: String,
-  artist: String,
-  album_title: String,
-  title: String,
-  track_id: String,
-  position: f64,
-  last_updated_position: Instant,
-  duration: f64,
-  volume: f64,
-  playback_rate: f64,
-}
-
 struct MprisPlayer {
-  button_pressed_listeners:
-    Arc<DashMap<usize, ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>>,
-  playback_position_changed_listeners:
-    Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>,
-  playback_position_seeked_listeners:
-    Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>,
+  button_pressed_listeners: ButtonListeners,
+  playback_position_changed_listeners: PositionListeners,
+  playback_position_seeked_listeners: PositionListeners,
   state: Arc<RwLock<MprisPlayerState>>,
 }
 
+impl MprisPlayer {
+  fn with_state<T>(&self, mapper: impl FnOnce(&MprisPlayerState) -> T) -> Result<T, MethodErr> {
+    self
+      .state
+      .read()
+      .map(|state| mapper(&state))
+      .map_err(|_| MethodErr::failed("Failed to read media player state"))
+  }
+
+  fn emit_button(&self, button: &str) {
+    emit_string(&self.button_pressed_listeners, button);
+  }
+
+  fn emit_button_if(&self, allowed: impl FnOnce(&MprisPlayerState) -> bool, button: &str) {
+    let Ok(state) = self.state.read() else {
+      return;
+    };
+    if allowed(&state) {
+      self.emit_button(button);
+    }
+  }
+}
+
 impl OrgMprisMediaPlayer2 for MprisPlayer {
-  fn raise(&mut self) -> Result<(), ::dbus::MethodErr> {
+  fn raise(&mut self) -> Result<(), MethodErr> {
     Ok(())
   }
 
-  fn quit(&mut self) -> Result<(), ::dbus::MethodErr> {
+  fn quit(&mut self) -> Result<(), MethodErr> {
     Ok(())
   }
 
-  fn can_quit(&self) -> Result<bool, ::dbus::MethodErr> {
+  fn can_quit(&self) -> Result<bool, MethodErr> {
     Ok(false)
   }
 
-  fn fullscreen(&self) -> Result<bool, ::dbus::MethodErr> {
+  fn fullscreen(&self) -> Result<bool, MethodErr> {
     Ok(false)
   }
 
-  fn set_fullscreen(&self, _value: bool) -> Result<(), ::dbus::MethodErr> {
+  fn set_fullscreen(&self, _value: bool) -> Result<(), MethodErr> {
     Err(MethodErr::failed("Fullscreen cannot be set"))
   }
 
-  fn can_set_fullscreen(&self) -> Result<bool, ::dbus::MethodErr> {
+  fn can_set_fullscreen(&self) -> Result<bool, MethodErr> {
     Ok(false)
   }
 
-  fn can_raise(&self) -> Result<bool, ::dbus::MethodErr> {
+  fn can_raise(&self) -> Result<bool, MethodErr> {
     Ok(false)
   }
 
-  fn has_track_list(&self) -> Result<bool, ::dbus::MethodErr> {
+  fn has_track_list(&self) -> Result<bool, MethodErr> {
     Ok(false)
   }
 
-  fn identity(&self) -> Result<String, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.identity.to_owned());
-    }
-
-    Err(MethodErr::failed("An error occurred while reading Volume"))
+  fn identity(&self) -> Result<String, MethodErr> {
+    self.with_state(|state| state.identity.clone())
   }
 
-  fn desktop_entry(&self) -> Result<String, ::dbus::MethodErr> {
+  fn desktop_entry(&self) -> Result<String, MethodErr> {
     Err(MethodErr::no_property("DesktopEntry is not implemented"))
   }
 
-  fn supported_uri_schemes(&self) -> Result<Vec<String>, ::dbus::MethodErr> {
+  fn supported_uri_schemes(&self) -> Result<Vec<String>, MethodErr> {
     Ok(vec![])
   }
 
-  fn supported_mime_types(&self) -> Result<Vec<String>, ::dbus::MethodErr> {
+  fn supported_mime_types(&self) -> Result<Vec<String>, MethodErr> {
     Ok(vec![])
   }
 }
 
 impl OrgMprisMediaPlayer2Player for MprisPlayer {
-  fn next(&mut self) -> Result<(), ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      if !state.can_go_next {
-        return Ok(());
-      }
-    }
-
-    for listener in self.button_pressed_listeners.iter() {
-      listener.call(
-        Ok("next".to_string()),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
-    }
-
+  fn next(&mut self) -> Result<(), MethodErr> {
+    self.emit_button_if(|state| state.can_go_next, "next");
     Ok(())
   }
 
-  fn previous(&mut self) -> Result<(), ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      if !state.can_go_previous {
-        return Ok(());
-      }
-    }
-
-    for listener in self.button_pressed_listeners.iter() {
-      listener.call(
-        Ok("previous".to_string()),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
-    }
-
+  fn previous(&mut self) -> Result<(), MethodErr> {
+    self.emit_button_if(|state| state.can_go_previous, "previous");
     Ok(())
   }
 
-  fn pause(&mut self) -> Result<(), ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      if !state.can_pause {
-        return Ok(());
-      }
-    }
-
-    for listener in self.button_pressed_listeners.iter() {
-      listener.call(
-        Ok("pause".to_string()),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
-    }
-
+  fn pause(&mut self) -> Result<(), MethodErr> {
+    self.emit_button_if(|state| state.can_pause, "pause");
     Ok(())
   }
 
-  fn play_pause(&mut self) -> Result<(), ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      if !state.can_pause {
-        return Err(MethodErr::failed("This media player cannot be paused"));
-      }
+  fn play_pause(&mut self) -> Result<(), MethodErr> {
+    let can_toggle = self.with_state(|state| state.can_pause || state.can_play)?;
+    if !can_toggle {
+      return Err(MethodErr::failed(
+        "This media player cannot play or pause",
+      ));
     }
-
-    for listener in self.button_pressed_listeners.iter() {
-      listener.call(
-        Ok("playpause".to_string()),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
-    }
-
+    self.emit_button("playpause");
     Ok(())
   }
 
-  fn stop(&mut self) -> Result<(), ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      if !state.can_control {
-        return Err(MethodErr::failed("This media player cannot be controlled"));
-      }
+  fn stop(&mut self) -> Result<(), MethodErr> {
+    let can_control = self.with_state(|state| state.can_control)?;
+    if !can_control {
+      return Err(MethodErr::failed("This media player cannot be controlled"));
     }
-
-    for listener in self.button_pressed_listeners.iter() {
-      listener.call(
-        Ok("stop".to_string()),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
-    }
-
+    self.emit_button("stop");
     Ok(())
   }
 
-  fn play(&mut self) -> Result<(), ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      if !state.can_play {
-        return Ok(());
-      }
-    }
-
-    for listener in self.button_pressed_listeners.iter() {
-      listener.call(
-        Ok("play".to_string()),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
-    }
-
+  fn play(&mut self) -> Result<(), MethodErr> {
+    self.emit_button_if(|state| state.can_play, "play");
     Ok(())
   }
 
-  fn seek(&mut self, offset: i64) -> Result<(), ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      if !state.can_seek {
-        return Ok(());
-      }
+  fn seek(&mut self, offset: i64) -> Result<(), MethodErr> {
+    let can_seek = self.with_state(|state| state.can_seek)?;
+    if !can_seek {
+      return Ok(());
     }
 
-    for listener in self.playback_position_seeked_listeners.iter() {
-      listener.call(
-        Ok(FloatDuration::microseconds(offset as f64).as_seconds()),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
-    }
-
+    emit_f64(
+      &self.playback_position_seeked_listeners,
+      FloatDuration::microseconds(offset as f64).as_seconds(),
+    );
     Ok(())
   }
 
   fn set_position(
     &mut self,
-    track_id: ::dbus::Path<'static>,
+    track_id: Path<'static>,
     position: i64,
-  ) -> Result<(), ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      if !state.can_seek {
-        return Ok(());
+  ) -> Result<(), MethodErr> {
+    let accepted = self.with_state(|state| {
+      if !state.can_seek || position < 0 {
+        return false;
       }
-      if position < 0 {
-        return Ok(());
-      }
-      if Duration::from_micros(position as u64).as_secs_f64() > state.duration {
-        return Ok(());
-      }
-      // The track id being different signifies that this may have been called too late and should be ignored
-      if track_id.to_string() != format!("/xosms/trackid/{}", state.track_id) {
-        return Ok(());
-      }
-    }
 
-    for listener in self.playback_position_changed_listeners.iter() {
-      listener.call(
-        Ok(Duration::from_micros(position as u64).as_secs_f64()),
-        ThreadsafeFunctionCallMode::NonBlocking,
+      let requested_seconds = Duration::from_micros(position as u64).as_secs_f64();
+      if requested_seconds > state.duration {
+        return false;
+      }
+
+      // Stale SetPosition for a previous track must be ignored.
+      track_id == state.track_object_path()
+    })?;
+
+    if accepted {
+      emit_f64(
+        &self.playback_position_changed_listeners,
+        Duration::from_micros(position as u64).as_secs_f64(),
       );
     }
 
     Ok(())
   }
 
-  fn open_uri(&mut self, _uri: String) -> Result<(), ::dbus::MethodErr> {
+  fn open_uri(&mut self, _uri: String) -> Result<(), MethodErr> {
     Err(MethodErr::failed("OpenUri is not supported"))
   }
 
-  fn playback_status(&self) -> Result<String, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      return match state.playback_status {
-        MediaPlayerPlaybackStatus::Playing => Ok("Playing".to_string()),
-        MediaPlayerPlaybackStatus::Paused => Ok("Paused".to_string()),
-        MediaPlayerPlaybackStatus::Stopped => Ok("Stopped".to_string()),
-        _ => Ok("Stopped".to_string()),
-      };
+  fn playback_status(&self) -> Result<String, MethodErr> {
+    self.with_state(|state| state.playback_status_label().to_string())
+  }
+
+  fn loop_status(&self) -> Result<String, MethodErr> {
+    Err(MethodErr::no_property("LoopStatus is not implemented"))
+  }
+
+  fn set_loop_status(&self, _value: String) -> Result<(), MethodErr> {
+    Err(MethodErr::no_property("LoopStatus is not implemented"))
+  }
+
+  fn rate(&self) -> Result<f64, MethodErr> {
+    self.with_state(|state| state.playback_rate)
+  }
+
+  fn set_rate(&self, value: f64) -> Result<(), MethodErr> {
+    // MPRIS: Rate = 0.0 is equivalent to Pause.
+    if value == 0.0 {
+      let can_pause = self.with_state(|state| state.can_pause)?;
+      if can_pause {
+        self.emit_button("pause");
+      }
+      return Ok(());
     }
 
-    Err(MethodErr::failed(
-      "An error occurred while reading PlaybackStatus",
-    ))
-  }
-
-  fn loop_status(&self) -> Result<String, ::dbus::MethodErr> {
-    Err(MethodErr::no_property("LoopStatus is not implemented"))
-  }
-
-  fn set_loop_status(&self, _value: String) -> Result<(), ::dbus::MethodErr> {
-    Err(MethodErr::no_property("LoopStatus is not implemented"))
-  }
-
-  fn rate(&self) -> Result<f64, ::dbus::MethodErr> {
-    Ok(1.0)
-  }
-
-  fn set_rate(&self, _value: f64) -> Result<(), ::dbus::MethodErr> {
-    // Clients should not be calling this with 0.0 but D-Bus states rate being set to 0.0 is equivalent to pausing
-    // TODO: Make 0.0 call pause
-
+    if let Ok(mut state) = self.state.write() {
+      state.playback_rate = value;
+    }
     Ok(())
   }
 
-  fn shuffle(&self) -> Result<bool, ::dbus::MethodErr> {
+  fn shuffle(&self) -> Result<bool, MethodErr> {
     Err(MethodErr::no_property("Shuffle is not implemented"))
   }
 
-  fn set_shuffle(&self, _value: bool) -> Result<(), ::dbus::MethodErr> {
+  fn set_shuffle(&self, _value: bool) -> Result<(), MethodErr> {
     Err(MethodErr::no_property("Shuffle is not implemented"))
   }
 
-  fn metadata(&self) -> Result<::dbus::arg::PropMap, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      let mut metadata = PropMap::new();
-      metadata.insert(
-        "mpris:trackid".to_string(),
-        Variant(Box::new(format!("/xosms/trackid/{}", state.track_id))),
-      );
-      metadata.insert(
-        "mpris:length".to_string(),
-        Variant(Box::new(
-          FloatDuration::seconds(state.duration)
-            .as_microseconds()
-            .max(i64::MIN as f64)
-            .min(i64::MAX as f64)
-            .round() as i64,
-        )),
-      );
-      metadata.insert(
-        "mpris:artUrl".to_string(),
-        Variant(Box::new(state.thumbnail.to_owned())),
-      );
-      metadata.insert(
-        "xesam:title".to_string(),
-        Variant(Box::new(state.title.to_owned())),
-      );
-      metadata.insert(
-        "xesam:album".to_string(),
-        Variant(Box::new(state.album_title.to_owned())),
-      );
-      metadata.insert(
-        "xesam:artist".to_string(),
-        Variant(Box::new(state.artist.to_owned())),
-      );
-      return Ok(metadata);
-    }
-
-    Err(MethodErr::failed(
-      "An error occurred while reading Metadata",
-    ))
+  fn metadata(&self) -> Result<PropMap, MethodErr> {
+    self.with_state(|state| state.metadata_map())
   }
 
-  fn volume(&self) -> Result<f64, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.volume);
-    }
-
-    Err(MethodErr::failed("An error occurred while reading Volume"))
+  fn volume(&self) -> Result<f64, MethodErr> {
+    self.with_state(|state| state.volume)
   }
 
-  fn set_volume(&self, value: f64) -> Result<(), ::dbus::MethodErr> {
+  fn set_volume(&self, value: f64) -> Result<(), MethodErr> {
     if let Ok(mut state) = self.state.write() {
-      state.volume = value;
+      state.volume = value.clamp(0.0, 1.0);
       return Ok(());
     }
 
     Err(MethodErr::failed("An error occurred while writing Volume"))
   }
 
-  fn position(&self) -> Result<i64, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      return Ok(
-        FloatDuration::seconds(state.position)
-          .as_microseconds()
-          .max(i64::MIN as f64)
-          .min(i64::MAX as f64)
-          .round() as i64,
-      );
-    }
-
-    Err(MethodErr::failed("An error occurred while reading Volume"))
+  fn position(&self) -> Result<i64, MethodErr> {
+    self.with_state(|state| seconds_to_micros(state.position))
   }
 
-  fn minimum_rate(&self) -> Result<f64, ::dbus::MethodErr> {
+  fn minimum_rate(&self) -> Result<f64, MethodErr> {
     Ok(1.0)
   }
 
-  fn maximum_rate(&self) -> Result<f64, ::dbus::MethodErr> {
+  fn maximum_rate(&self) -> Result<f64, MethodErr> {
     Ok(1.0)
   }
 
-  fn can_go_next(&self) -> Result<bool, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_go_next);
-    }
-
-    Err(MethodErr::failed(
-      "An error occurred while reading CanGoNext",
-    ))
+  fn can_go_next(&self) -> Result<bool, MethodErr> {
+    self.with_state(|state| state.can_go_next)
   }
 
-  fn can_go_previous(&self) -> Result<bool, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_go_previous);
-    }
-
-    Err(MethodErr::failed(
-      "An error occurred while reading CanGoPrevious",
-    ))
+  fn can_go_previous(&self) -> Result<bool, MethodErr> {
+    self.with_state(|state| state.can_go_previous)
   }
 
-  fn can_play(&self) -> Result<bool, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_play);
-    }
-
-    Err(MethodErr::failed("An error occurred while reading CanPlay"))
+  fn can_play(&self) -> Result<bool, MethodErr> {
+    self.with_state(|state| state.can_play)
   }
 
-  fn can_pause(&self) -> Result<bool, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_pause);
-    }
-
-    Err(MethodErr::failed(
-      "An error occurred while reading CanPause",
-    ))
+  fn can_pause(&self) -> Result<bool, MethodErr> {
+    self.with_state(|state| state.can_pause)
   }
 
-  fn can_seek(&self) -> Result<bool, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_seek);
-    }
-
-    Err(MethodErr::failed("An error occurred while reading CanSeek"))
+  fn can_seek(&self) -> Result<bool, MethodErr> {
+    self.with_state(|state| state.can_seek)
   }
 
-  fn can_control(&self) -> Result<bool, ::dbus::MethodErr> {
-    if let Ok(state) = self.state.read() {
-      return Ok(state.can_control);
-    }
+  fn can_control(&self) -> Result<bool, MethodErr> {
+    self.with_state(|state| state.can_control)
+  }
+}
 
-    Err(MethodErr::failed(
-      "An error occurred while reading CanControl",
-    ))
+fn mpris_path() -> Path<'static> {
+  Path::new(MPRIS_OBJECT_PATH).expect("valid MPRIS object path")
+}
+
+fn seconds_to_micros(seconds: f64) -> i64 {
+  FloatDuration::seconds(seconds)
+    .as_microseconds()
+    .clamp(i64::MIN as f64, i64::MAX as f64)
+    .round() as i64
+}
+
+fn insert_string_listener(
+  listeners: &ButtonListeners,
+  env: Env,
+  callback_ptr: usize,
+  callback: JsFunction,
+) -> napi::Result<()> {
+  if listeners.contains_key(&callback_ptr) {
+    return Ok(());
+  }
+
+  let mut threadsafe_callback = callback.create_threadsafe_function(0, |ctx| {
+    ctx.env.create_string_from_std(ctx.value).map(|v| vec![v])
+  })?;
+  let _ = threadsafe_callback.unref(&env)?;
+  listeners.insert(callback_ptr, threadsafe_callback);
+  Ok(())
+}
+
+fn insert_f64_listener(
+  listeners: &PositionListeners,
+  env: Env,
+  callback_ptr: usize,
+  callback: JsFunction,
+) -> napi::Result<()> {
+  if listeners.contains_key(&callback_ptr) {
+    return Ok(());
+  }
+
+  let mut threadsafe_callback =
+    callback.create_threadsafe_function(0, |ctx| ctx.env.create_double(ctx.value).map(|v| vec![v]))?;
+  let _ = threadsafe_callback.unref(&env)?;
+  listeners.insert(callback_ptr, threadsafe_callback);
+  Ok(())
+}
+
+fn emit_string(listeners: &ButtonListeners, value: &str) {
+  for listener in listeners.iter() {
+    listener.call(
+      Ok(value.to_string()),
+      ThreadsafeFunctionCallMode::NonBlocking,
+    );
+  }
+}
+
+fn emit_f64(listeners: &PositionListeners, value: f64) {
+  for listener in listeners.iter() {
+    listener.call(Ok(value), ThreadsafeFunctionCallMode::NonBlocking);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{seconds_to_micros, MediaPlayerPlaybackStatus, MprisPlayerState, NO_TRACK_PATH};
+
+  #[test]
+  fn empty_track_id_uses_mpris_no_track_path() {
+    let state = MprisPlayerState::new(String::from("Test Player"));
+    assert_eq!(state.track_object_path().to_string(), NO_TRACK_PATH);
+  }
+
+  #[test]
+  fn metadata_uses_artist_array_and_object_path_track_id() {
+    let mut state = MprisPlayerState::new(String::from("Test Player"));
+    state.track_id = String::from("abc");
+    state.artist = String::from("Artist");
+    state.title = String::from("Title");
+    state.duration = 12.5;
+
+    let metadata = state.metadata_map();
+    assert!(metadata.contains_key("mpris:trackid"));
+    assert!(metadata.contains_key("xesam:artist"));
+    assert_eq!(
+      state.track_object_path().to_string(),
+      "/xosms/trackid/abc"
+    );
+    assert_eq!(seconds_to_micros(12.5), 12_500_000);
+  }
+
+  #[test]
+  fn seeked_emits_only_on_large_position_jumps() {
+    let mut state = MprisPlayerState::new(String::from("Test Player"));
+    state.position = 10.0;
+    state.playback_rate = 1.0;
+    assert!(state.should_emit_seeked(12.0));
+    assert!(!state.should_emit_seeked(10.5));
+  }
+
+  #[test]
+  fn playback_status_label_maps_unknown_to_stopped() {
+    let mut state = MprisPlayerState::new(String::from("Test Player"));
+    state.playback_status = MediaPlayerPlaybackStatus::Unknown;
+    assert_eq!(state.playback_status_label(), "Stopped");
+    state.playback_status = MediaPlayerPlaybackStatus::Playing;
+    assert_eq!(state.playback_status_label(), "Playing");
   }
 }
