@@ -37,7 +37,7 @@ pub enum MediaPlayerMediaType {
 }
 
 #[napi]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MediaPlayerPlaybackStatus {
   Unknown = -1,
   Playing = 1,

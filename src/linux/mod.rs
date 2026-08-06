@@ -36,7 +36,7 @@ type ButtonListeners = Arc<DashMap<usize, ThreadsafeFunction<String, ErrorStrate
 type PositionListeners = Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>;
 
 #[napi]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MediaPlayerThumbnailType {
   Unknown = -1,
   File = 1,
@@ -44,14 +44,14 @@ pub enum MediaPlayerThumbnailType {
 }
 
 #[napi]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MediaPlayerMediaType {
   Unknown = -1,
   Music = 1,
 }
 
 #[napi]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MediaPlayerPlaybackStatus {
   Unknown = -1,
   Playing = 1,
