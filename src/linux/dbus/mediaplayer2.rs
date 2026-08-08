@@ -33,22 +33,16 @@ where T: OrgMprisMediaPlayer2 + Send + 'static
         });
         b.property::<bool, _>("CanQuit")
             .get(|_, t| t.can_quit());
-        b.property::<bool, _>("Fullscreen")
-            .get(|_, t| t.fullscreen())
-            .set(|_, t, value| t.set_fullscreen(value).map(|_| None))
-            .annotate("org.mpris.MediaPlayer2.property.optional", "true");
-        b.property::<bool, _>("CanSetFullscreen")
-            .get(|_, t| t.can_set_fullscreen())
-            .annotate("org.mpris.MediaPlayer2.property.optional", "true");
+        // Fullscreen / CanSetFullscreen are optional and unsettable here —
+        // omit so clients do not advertise a dead setter.
         b.property::<bool, _>("CanRaise")
             .get(|_, t| t.can_raise());
         b.property::<bool, _>("HasTrackList")
             .get(|_, t| t.has_track_list());
         b.property::<String, _>("Identity")
             .get(|_, t| t.identity());
-        b.property::<String, _>("DesktopEntry")
-            .get(|_, t| t.desktop_entry())
-            .annotate("org.mpris.MediaPlayer2.property.optional", "true");
+        // DesktopEntry is optional. Do not register it unless implemented —
+        // a failing getter breaks Properties.GetAll (playerctl).
         b.property::<Vec<String>, _>("SupportedUriSchemes")
             .get(|_, t| t.supported_uri_schemes());
         b.property::<Vec<String>, _>("SupportedMimeTypes")

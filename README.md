@@ -7,10 +7,35 @@ A cross platform media service library made in Rust for Node to easily and seame
 
 ## Current Platforms Supported
 - [x] Windows
-- [ ] MacOS
+- [x] MacOS
 - [x] Linux (via MPRIS)
 
 Even if your platform above isn't currently supported, the beauty of xosms is that it will still compile for it but noop on everything.
+
+## Linux (MPRIS / playerctl)
+
+`serviceName` becomes the D-Bus well-known name suffix `org.mpris.MediaPlayer2.{serviceName}` (sanitized to a valid D-Bus name element).
+
+Property setters queue MPRIS `PropertiesChanged` signals. Call `update()` after changing status, metadata, buttons, timeline, or rate so shells and `playerctl` see them. `activate()` flushes an initial snapshot once.
+
+Play/pause stay disabled until you set `playButtonEnabled` / `pauseButtonEnabled` to `true` — otherwise `playerctl play` may refuse the player.
+
+```js
+const { MediaPlayer, MediaPlayerPlaybackStatus } = require("xosms");
+
+const player = new MediaPlayer("xosms", "Xosms");
+player.activate();
+
+player.playButtonEnabled = true;
+player.pauseButtonEnabled = true;
+player.playbackStatus = MediaPlayerPlaybackStatus.Playing;
+player.title = "Track";
+player.artist = "Artist";
+player.setTimeline(180, 0);
+player.update(); // flush PropertiesChanged
+
+// playerctl -l  →  xosms
+```
 
 # Development
 To setup and locally develop and build xosms please ensure you have

@@ -94,20 +94,12 @@ where T: OrgMprisMediaPlayer2Player + Send + 'static
         b.property::<String, _>("PlaybackStatus")
             .get(|_, t| t.playback_status())
             .annotate("org.freedesktop.DBus.Property.EmitsChangedSignal", "true");
-        b.property::<String, _>("LoopStatus")
-            .get(|_, t| t.loop_status())
-            .set(|_, t, value| t.set_loop_status(value).map(|_| None))
-            .annotate("org.mpris.MediaPlayer2.property.optional", "true")
-            .annotate("org.freedesktop.DBus.Property.EmitsChangedSignal", "true");
+        // LoopStatus / Shuffle are optional. Do not register them unless
+        // implemented — failing getters break Properties.GetAll (playerctl).
         b.property::<f64, _>("Rate")
             .get(|_, t| t.rate())
             .set(|_, t, value| t.set_rate(value).map(|_| None))
             .annotate("org.freedesktop.DBus.Property.EmitsChangedSignal", "true");
-        b.property::<bool, _>("Shuffle")
-            .get(|_, t| t.shuffle())
-            .set(|_, t, value| t.set_shuffle(value).map(|_| None))
-            .annotate("org.freedesktop.DBus.Property.EmitsChangedSignal", "true")
-            .annotate("org.mpris.MediaPlayer2.property.optional", "true");
         b.property::<arg::PropMap, _>("Metadata")
             .get(|_, t| t.metadata())
             .annotate("org.freedesktop.DBus.Property.EmitsChangedSignal", "true");

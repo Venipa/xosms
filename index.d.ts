@@ -50,7 +50,13 @@ export class MediaPlayer {
    * Alias for removeEventListener
    */
   off(eventName: 'buttonpressed' | 'positionchanged' | 'positionseeked', callback: (...args: any[]) => any): void
-  /** Instructs the media service to update its media information being displayed */
+  /**
+   * Instructs the media service to update its media information being displayed
+   *
+   * On Linux (MPRIS), property setters only queue PropertiesChanged. Call update()
+   * after changing status, metadata, buttons, or rate so playerctl and desktop shells
+   * see the new values. activate() already flushes once.
+   */
   update(): void
   /** Sets the thumbnail */
   setThumbnail(thumbnail: MediaPlayerThumbnail): void

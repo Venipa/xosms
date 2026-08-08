@@ -26,11 +26,14 @@ use self::dbus::{
     register_org_mpris_media_player2_player, OrgMprisMediaPlayer2Player,
     OrgMprisMediaPlayer2PlayerSeeked,
   },
-  session::DBusSession,
+  session::{sanitize_mpris_instance_name, DBusSession},
 };
 
 const MPRIS_OBJECT_PATH: &str = "/org/mpris/MediaPlayer2";
 const NO_TRACK_PATH: &str = "/org/mpris/MediaPlayer2/TrackList/NoTrack";
+/// MPRIS MinimumRate must be > 0.0. Advertise the range we accept for Rate.
+const MIN_PLAYBACK_RATE: f64 = 0.25;
+const MAX_PLAYBACK_RATE: f64 = 2.0;
 
 type ButtonListeners = Arc<DashMap<usize, ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>>;
 type PositionListeners = Arc<DashMap<usize, ThreadsafeFunction<f64, ErrorStrategy::CalleeHandled>>>;
@@ -212,6 +215,9 @@ impl MediaPlayer {
   #[napi(constructor)]
   #[allow(dead_code)]
   pub fn new(service_name: String, identity: String) -> napi::Result<Self> {
+    let service_name = sanitize_mpris_instance_name(&service_name)
+      .map_err(napi::Error::from_reason)?;
+
     Ok(Self {
       service_name,
       button_pressed_listeners: Arc::new(DashMap::new()),
@@ -258,6 +264,8 @@ impl MediaPlayer {
     }
 
     self.active = true;
+    self.queue_initial_properties();
+    self.emit_properties_changed();
     Ok(())
   }
 
@@ -369,6 +377,10 @@ impl MediaPlayer {
   }
 
   /// Instructs the media service to update its media information being displayed
+  ///
+  /// On Linux (MPRIS), property setters only queue `PropertiesChanged`. Call
+  /// `update()` after changing status, metadata, buttons, or rate so playerctl
+  /// and desktop shells see the new values. `activate()` already flushes once.
   #[napi]
   #[allow(dead_code)]
   pub fn update(&mut self) -> napi::Result<()> {
@@ -537,6 +549,12 @@ impl MediaPlayer {
   #[napi(setter)]
   #[allow(dead_code)]
   pub fn set_playback_rate(&mut self, playback_rate: f64) -> napi::Result<()> {
+    if !(MIN_PLAYBACK_RATE..=MAX_PLAYBACK_RATE).contains(&playback_rate) {
+      return Err(napi::Error::from_reason(format!(
+        "playbackRate must be between {MIN_PLAYBACK_RATE} and {MAX_PLAYBACK_RATE}"
+      )));
+    }
+
     self.with_state_mut(|state| state.playback_rate = playback_rate);
     self
       .properties_changed
@@ -688,6 +706,41 @@ impl MediaPlayer {
       .add_prop(name, EmitsChangedSignal::True, || Box::new(value));
   }
 
+  fn queue_initial_properties(&mut self) {
+    let Ok(state) = self.player_state.read() else {
+      return;
+    };
+
+    let playback_status = state.playback_status_label().to_string();
+    let rate = state.playback_rate;
+    let metadata = state.metadata_map();
+    let can_play = state.can_play;
+    let can_pause = state.can_pause;
+    let can_go_previous = state.can_go_previous;
+    let can_go_next = state.can_go_next;
+    let can_seek = state.can_seek;
+    let can_control = state.can_control;
+    drop(state);
+
+    self
+      .properties_changed
+      .add_prop("PlaybackStatus", EmitsChangedSignal::True, || {
+        Box::new(playback_status)
+      });
+    self
+      .properties_changed
+      .add_prop("Rate", EmitsChangedSignal::True, || Box::new(rate));
+    self
+      .properties_changed
+      .add_prop("Metadata", EmitsChangedSignal::True, || Box::new(metadata));
+    self.queue_bool_prop("CanPlay", can_play);
+    self.queue_bool_prop("CanPause", can_pause);
+    self.queue_bool_prop("CanGoPrevious", can_go_previous);
+    self.queue_bool_prop("CanGoNext", can_go_next);
+    self.queue_bool_prop("CanSeek", can_seek);
+    self.queue_bool_prop("CanControl", can_control);
+  }
+
   fn queue_metadata_changed(&mut self) {
     let metadata = self
       .player_state
@@ -763,7 +816,7 @@ impl OrgMprisMediaPlayer2 for MprisPlayer {
   }
 
   fn set_fullscreen(&self, _value: bool) -> Result<(), MethodErr> {
-    Err(MethodErr::failed("Fullscreen cannot be set"))
+    Ok(())
   }
 
   fn can_set_fullscreen(&self) -> Result<bool, MethodErr> {
@@ -783,7 +836,8 @@ impl OrgMprisMediaPlayer2 for MprisPlayer {
   }
 
   fn desktop_entry(&self) -> Result<String, MethodErr> {
-    Err(MethodErr::no_property("DesktopEntry is not implemented"))
+    // Optional; not registered on the interface. Safe default if ever re-added.
+    Ok(String::new())
   }
 
   fn supported_uri_schemes(&self) -> Result<Vec<String>, MethodErr> {
@@ -887,11 +941,12 @@ impl OrgMprisMediaPlayer2Player for MprisPlayer {
   }
 
   fn loop_status(&self) -> Result<String, MethodErr> {
-    Err(MethodErr::no_property("LoopStatus is not implemented"))
+    // Optional; not registered on the interface. Safe default if ever re-added.
+    Ok(String::from("None"))
   }
 
   fn set_loop_status(&self, _value: String) -> Result<(), MethodErr> {
-    Err(MethodErr::no_property("LoopStatus is not implemented"))
+    Ok(())
   }
 
   fn rate(&self) -> Result<f64, MethodErr> {
@@ -908,6 +963,10 @@ impl OrgMprisMediaPlayer2Player for MprisPlayer {
       return Ok(());
     }
 
+    if !(MIN_PLAYBACK_RATE..=MAX_PLAYBACK_RATE).contains(&value) {
+      return Err(MethodErr::invalid_arg("Rate out of MinimumRate..MaximumRate"));
+    }
+
     if let Ok(mut state) = self.state.write() {
       state.playback_rate = value;
     }
@@ -915,11 +974,12 @@ impl OrgMprisMediaPlayer2Player for MprisPlayer {
   }
 
   fn shuffle(&self) -> Result<bool, MethodErr> {
-    Err(MethodErr::no_property("Shuffle is not implemented"))
+    // Optional; not registered on the interface. Safe default if ever re-added.
+    Ok(false)
   }
 
   fn set_shuffle(&self, _value: bool) -> Result<(), MethodErr> {
-    Err(MethodErr::no_property("Shuffle is not implemented"))
+    Ok(())
   }
 
   fn metadata(&self) -> Result<PropMap, MethodErr> {
@@ -944,11 +1004,11 @@ impl OrgMprisMediaPlayer2Player for MprisPlayer {
   }
 
   fn minimum_rate(&self) -> Result<f64, MethodErr> {
-    Ok(1.0)
+    Ok(MIN_PLAYBACK_RATE)
   }
 
   fn maximum_rate(&self) -> Result<f64, MethodErr> {
-    Ok(1.0)
+    Ok(MAX_PLAYBACK_RATE)
   }
 
   fn can_go_next(&self) -> Result<bool, MethodErr> {
