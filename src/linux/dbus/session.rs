@@ -1,4 +1,5 @@
 use std::{
+  panic::{self, AssertUnwindSafe},
   sync::mpsc,
   thread::{self, JoinHandle},
   time::Duration,
@@ -95,7 +96,11 @@ impl DBusSession {
 
           while let Some(message) = connection.channel().pop_message() {
             if let Some(player) = registered.as_mut() {
-              let _ = player.crossroads.handle_message(message, &connection);
+              // Panics inside interface handlers (e.g. invalid Path construction)
+              // must not abort the host Electron process.
+              let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = player.crossroads.handle_message(message, &connection);
+              }));
             }
           }
         }

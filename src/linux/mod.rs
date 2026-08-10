@@ -147,10 +147,9 @@ impl MprisPlayerState {
   }
 
   fn track_object_path(&self) -> Path<'static> {
-    if self.track_id.is_empty() {
-      Path::from(NO_TRACK_PATH.to_string())
-    } else {
-      Path::from(format!("/xosms/trackid/{}", self.track_id))
+    match sanitize_track_object_path(&self.track_id) {
+      Some(path) => path,
+      None => Path::from(NO_TRACK_PATH.to_string()),
     }
   }
 
@@ -1040,6 +1039,36 @@ fn mpris_path() -> Path<'static> {
   Path::new(MPRIS_OBJECT_PATH).expect("valid MPRIS object path")
 }
 
+/// Build a valid D-Bus object path for `mpris:trackid`.
+///
+/// Object path elements may only use `[A-Za-z0-9_]`. Raw media ids (YouTube,
+/// etc.) often contain `-` and other chars; `Path::from` panics on those and
+/// aborts the host process when Metadata is read on the D-Bus thread.
+fn sanitize_track_object_path(track_id: &str) -> Option<Path<'static>> {
+  if track_id.is_empty() {
+    return None;
+  }
+
+  let mut element = String::with_capacity(track_id.len());
+  for character in track_id.chars() {
+    if character.is_ascii_alphanumeric() || character == '_' {
+      element.push(character);
+    } else {
+      element.push('_');
+    }
+  }
+
+  while element.contains("__") {
+    element = element.replace("__", "_");
+  }
+  let element = element.trim_matches('_');
+  if element.is_empty() {
+    return None;
+  }
+
+  Path::new(format!("/xosms/trackid/{element}")).ok()
+}
+
 fn seconds_to_micros(seconds: f64) -> i64 {
   FloatDuration::seconds(seconds)
     .as_microseconds()
@@ -1123,6 +1152,24 @@ mod tests {
       "/xosms/trackid/abc"
     );
     assert_eq!(seconds_to_micros(12.5), 12_500_000);
+  }
+
+  #[test]
+  fn track_id_with_hyphen_sanitizes_to_valid_object_path() {
+    let mut state = MprisPlayerState::new(String::from("Test Player"));
+    // YouTube-style ids include `-`, which is illegal in D-Bus object paths.
+    state.track_id = String::from("dQw4w9WgXcQ-extra");
+    assert_eq!(
+      state.track_object_path().to_string(),
+      "/xosms/trackid/dQw4w9WgXcQ_extra"
+    );
+  }
+
+  #[test]
+  fn track_id_with_only_invalid_chars_falls_back_to_no_track() {
+    let mut state = MprisPlayerState::new(String::from("Test Player"));
+    state.track_id = String::from("---");
+    assert_eq!(state.track_object_path().to_string(), NO_TRACK_PATH);
   }
 
   #[test]
